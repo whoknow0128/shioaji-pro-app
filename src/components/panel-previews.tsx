@@ -697,4 +697,12 @@ export const PANEL_PREVIEWS: Record<BlockType, ReactNode> = {
             <rect x='8' y='54' width='52' height='14' rx='5' fill={muted} fillOpacity='0.2' />
         </Frame>
     ),
+    scanner: (
+        <Frame>
+            <rect x='8' y='8' width='104' height='12' rx='2' fill={vars.color.accent} fillOpacity='0.5' />
+            <rect x='8' y='24' width='104' height='12' rx='2' fill={muted} fillOpacity='0.2' />
+            <rect x='8' y='40' width='104' height='12' rx='2' fill={muted} fillOpacity='0.2' />
+            <rect x='8' y='56' width='104' height='12' rx='2' fill={muted} fillOpacity='0.2' />
+        </Frame>
+    ),
 };

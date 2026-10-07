@@ -131,8 +131,8 @@ onAnyTick(tick => {
                     const aggCandles = aggregate(candles, timeframe);
                     const ma = sma(aggCandles, period);
                     if (ma.length >= 2 && prevPrice !== undefined) {
-                        const prevMa = ma[ma.length - 2].value;
-                        const currMa = ma[ma.length - 1].value;
+                        const prevMa = ma[ma.length - 2]?.value;
+                        const currMa = ma[ma.length - 1]?.value;
                         if (prevMa !== undefined && currMa !== undefined) {
                             if (cond.type === 'ma_cross_up') met = (prevPrice <= prevMa && price > currMa);
                             else if (cond.type === 'ma_cross_down') met = (prevPrice >= prevMa && price < currMa);
@@ -146,10 +146,10 @@ onAnyTick(tick => {
                     const aggCandles = aggregate(candles, timeframe);
                     const { k, d } = stoch(aggCandles, period, 3, 3);
                     if (k.length >= 2 && d.length >= 2) {
-                        const prevK = k[k.length - 2].value;
-                        const prevD = d[d.length - 2].value;
-                        const currK = k[k.length - 1].value;
-                        const currD = d[d.length - 1].value;
+                        const prevK = k[k.length - 2]?.value;
+                        const prevD = d[d.length - 2]?.value;
+                        const currK = k[k.length - 1]?.value;
+                        const currD = d[d.length - 1]?.value;
                         const th = cond.threshold || 0;
                         if (prevK !== undefined && prevD !== undefined && currK !== undefined && currD !== undefined) {
                             if (cond.type === 'kd_cross_up') met = (prevK <= prevD && currK > currD);
@@ -210,8 +210,10 @@ async function executeTrade(target: ScanTarget, currentPrice: number) {
     }
 }
 
-// 每 10 秒重新檢查一次，確保訂閱狀態正確
-setInterval(syncScannerSubscriptions, 10000);
-
-// 初始化
-syncScannerSubscriptions();
+let initialized = false;
+export function initScannerEngine() {
+    if (initialized) return;
+    initialized = true;
+    setInterval(syncScannerSubscriptions, 10000);
+    syncScannerSubscriptions();
+}
