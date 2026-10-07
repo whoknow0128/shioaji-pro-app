@@ -11,6 +11,7 @@ import {
     dmi,
     donchian,
     ema,
+    hma,
     keltner,
     macd,
     mfi,
@@ -147,6 +148,17 @@ export const INDICATOR_DEFS: IndicatorDef[] = [
                 ma6: fn(b, p.p6!),
             };
         },
+    },
+    {
+        type: 'hma',
+        label: 'HMA 赫爾移動平均',
+        short: 'HMA',
+        desc: '結合不同週期的 WMA 以降低落後，反應極快且平滑',
+        aliases: ['hma', 'hull', '赫爾', '均線'],
+        category: 'overlay',
+        params: [{ key: 'period', label: '週期', def: 20, min: 2, max: 500 }],
+        outputs: [{ key: 'line', label: 'HMA', kind: 'line', color: '#1fd286' }],
+        compute: (b, p) => ({ line: hma(b, p.period!) }),
     },
     {
         type: 'boll',

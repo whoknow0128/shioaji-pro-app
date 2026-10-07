@@ -68,6 +68,42 @@ export function wma(bars: Candle[], period: number): IndicatorPoint[] {
     return out;
 }
 
+export function wmaOf(points: IndicatorPoint[], period: number): IndicatorPoint[] {
+    const out: IndicatorPoint[] = [];
+    const denom = (period * (period + 1)) / 2;
+    const valid = points.filter((p) => p.value !== undefined);
+    for (let i = period - 1; i < valid.length; i++) {
+        let sum = 0;
+        for (let j = 0; j < period; j++) {
+            sum += valid[i - j]!.value! * (period - j);
+        }
+        out.push({ time: valid[i]!.time, value: sum / denom });
+    }
+    return out;
+}
+
+export function hma(bars: Candle[], period: number): IndicatorPoint[] {
+    const halfPeriod = Math.floor(period / 2);
+    const sqrtPeriod = Math.floor(Math.sqrt(period));
+    
+    if (halfPeriod < 1 || sqrtPeriod < 1) return [];
+
+    const wmaHalf = wma(bars, halfPeriod);
+    const wmaFull = wma(bars, period);
+    
+    const halfMap = new Map(wmaHalf.map((p) => [p.time, p.value]));
+    
+    const rawHma: IndicatorPoint[] = [];
+    for (const pFull of wmaFull) {
+        const vHalf = halfMap.get(pFull.time);
+        if (vHalf !== undefined && pFull.value !== undefined) {
+            rawHma.push({ time: pFull.time, value: 2 * vHalf - pFull.value });
+        }
+    }
+    
+    return wmaOf(rawHma, sqrtPeriod);
+}
+
 export function bollinger(
     bars: Candle[],
     period = 20,

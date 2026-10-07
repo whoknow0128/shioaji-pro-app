@@ -14,7 +14,9 @@ import { startBracketRuntime } from './lib/bracket';
 import { startOddSpreadService } from './lib/odd-spread-service';
 import { startTriggerEngine } from './lib/trigger-engine';
 import { initScannerEngine } from './lib/scanner-engine';
+import { initTelegramNotifier } from './lib/telegram-notifier';
 initScannerEngine();
+initTelegramNotifier();
 
 initTheme();
 startAnalytics();

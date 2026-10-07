@@ -88,10 +88,11 @@ export class IndicatorInstanceService {
         if (!def) throw new IndicatorControlError('not_found', `Unknown indicator type: ${type}`);
         for (const [key, value] of Object.entries(params)) {
             const p = def.params.find(p => p.key === key);
-            if (!p || !Number.isFinite(value) || value < p.min || value > p.max) {
+            if (!p || !Number.isFinite(value) || value < (p.min ?? -Infinity) || value > (p.max ?? Infinity)) {
                 throw new IndicatorControlError('invalid_arguments', `Invalid parameter ${key} for ${type}`);
             }
-            const steps = (value - p.min) / (p.step ?? 1);
+            const minVal = p.min ?? 0;
+            const steps = (value - minVal) / (p.step ?? 1);
             if (Math.abs(steps - Math.round(steps)) > 1e-7) throw new IndicatorControlError('invalid_arguments', `Parameter ${key} must follow step ${p.step ?? 1}`);
         }
     }

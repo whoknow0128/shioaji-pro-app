@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { useScanTargets, addScanTarget, removeScanTarget, toggleScanTargetActive } from '../lib/scanner-store';
+import { useScanTargets, addScanTarget, removeScanTarget, toggleScanTargetActive, updateScanTarget, formatTargetConditions, formatSingleCondition } from '../lib/scanner-store';
 import type { ScanTarget } from '../lib/scanner-store';
-import { Trash2, Play, Pause, Plus } from 'lucide-react';
+import { Trash2, Play, Pause, Plus, Repeat, Bell } from 'lucide-react';
+import { notify } from '../lib/trade';
 
 export function StrategyScannerPanel() {
     const targets = useScanTargets();
@@ -18,6 +19,7 @@ export function StrategyScannerPanel() {
     const [maPeriod, setMaPeriod] = useState('5');
     const [kdPeriod, setKdPeriod] = useState('9');
     const [timeframe, setTimeframe] = useState('1');
+    const [repeat, setRepeat] = useState(false);
 
     const handleAddCondition = () => {
         const needsThreshold = ['above', 'below', 'kd_k_cross_up', 'kd_k_cross_down', 'kd_d_cross_up', 'kd_d_cross_down', 'ma_above', 'ma_below', 'kd_k_above', 'kd_k_below', 'kd_d_above', 'kd_d_below'].includes(conditionType);
@@ -48,52 +50,11 @@ export function StrategyScannerPanel() {
             action,
             active: true,
             quantity: action === 'trade' ? Number(quantity) : undefined,
+            repeat,
         });
         
         setCode('');
         setStagedConditions([]); // 重置暫存區
-    };
-
-    const timeframeLabel = (tf?: number) => {
-        switch (tf) {
-            case 1: return '1分K';
-            case 5: return '5分K';
-            case 15: return '15分K';
-            case 30: return '30分K';
-            case 60: return '60分K';
-            case 1440: return '日K';
-            case 10080: return '周K';
-            default: return tf ? `${tf}分K` : '1分K';
-        }
-    };
-
-    const formatSingleCondition = (c: any) => {
-        const prefix = c.params?.timeframe ? `[${timeframeLabel(c.params.timeframe)}] ` : '';
-        switch (c.type) {
-            case 'above': return `價格向上突破 ${c.threshold}`;
-            case 'below': return `價格向下跌破 ${c.threshold}`;
-            case 'ma_cross_up': return `${prefix}價格向上突破 ${c.params?.ma_period || 5}MA`;
-            case 'ma_cross_down': return `${prefix}價格向下跌破 ${c.params?.ma_period || 5}MA`;
-            case 'kd_cross_up': return `${prefix}KD(${c.params?.kd_period || 9}) 黃金交叉`;
-            case 'kd_cross_down': return `${prefix}KD(${c.params?.kd_period || 9}) 死亡交叉`;
-            case 'kd_k_cross_up': return `${prefix}K值向上突破 ${c.threshold} (KD:${c.params?.kd_period || 9})`;
-            case 'kd_k_cross_down': return `${prefix}K值向下跌破 ${c.threshold} (KD:${c.params?.kd_period || 9})`;
-            case 'kd_d_cross_up': return `${prefix}D值向上突破 ${c.threshold} (KD:${c.params?.kd_period || 9})`;
-            case 'kd_d_cross_down': return `${prefix}D值向下跌破 ${c.threshold} (KD:${c.params?.kd_period || 9})`;
-            // 新增的狀態條件
-            case 'ma_above': return `${prefix}價格大於 ${c.params?.ma_period || 5}MA`;
-            case 'ma_below': return `${prefix}價格小於 ${c.params?.ma_period || 5}MA`;
-            case 'kd_k_above': return `${prefix}K值大於 ${c.threshold} (KD:${c.params?.kd_period || 9})`;
-            case 'kd_k_below': return `${prefix}K值小於 ${c.threshold} (KD:${c.params?.kd_period || 9})`;
-            case 'kd_d_above': return `${prefix}D值大於 ${c.threshold} (KD:${c.params?.kd_period || 9})`;
-            case 'kd_d_below': return `${prefix}D值小於 ${c.threshold} (KD:${c.params?.kd_period || 9})`;
-            default: return c.type;
-        }
-    };
-
-    const formatTargetConditions = (t: ScanTarget) => {
-        if (!t.conditions || t.conditions.length === 0) return '無條件 (請刪除)';
-        return t.conditions.map(c => `[${formatSingleCondition(c)}]`).join(' AND ');
     };
 
     const isIndicator = ['ma_cross_up', 'ma_cross_down', 'kd_cross_up', 'kd_cross_down', 'kd_k_cross_up', 'kd_k_cross_down', 'kd_d_cross_up', 'kd_d_cross_down', 'ma_above', 'ma_below', 'kd_k_above', 'kd_k_below', 'kd_d_above', 'kd_d_below'].includes(conditionType);
@@ -227,6 +188,11 @@ export function StrategyScannerPanel() {
                                 style={{ width: '60px', padding: '4px' }}
                             />
                         )}
+
+                        <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '13px' }}>
+                            <input type="checkbox" checked={repeat} onChange={e => setRepeat(e.target.checked)} />
+                            允許重複觸發
+                        </label>
                         
                         <button onClick={handleCreateStrategy} style={{ padding: '4px 8px', cursor: 'pointer', background: '#4CAF50', color: 'white', border: 'none', borderRadius: '4px' }}>
                             建立策略
@@ -243,13 +209,33 @@ export function StrategyScannerPanel() {
                         <div>
                             <strong>{t.code}</strong> - {formatTargetConditions(t)}
                             <span style={{ marginLeft: '8px', fontSize: '12px', color: t.action === 'trade' ? '#d9534f' : '#5bc0de' }}>
-                                [{t.action === 'trade' ? `自動買進 ${t.quantity} 張` : '提醒'}]
+                                [{t.action === 'trade' ? `自動買進 ${t.quantity} 張` : '提醒'}{t.repeat ? ' / 重複' : ' / 單次'}]
                             </span>
                             <span style={{ marginLeft: '8px', fontSize: '12px', color: t.status === 'monitoring' ? '#5cb85c' : t.status === 'error' ? '#d9534f' : '#f0ad4e' }}>
                                 ({t.status === 'monitoring' ? '監控中' : t.status === 'error' ? '失敗' : '已觸發'})
                             </span>
                         </div>
                         <div style={{ display: 'flex', gap: '8px' }}>
+                            <button 
+                                onClick={() => {
+                                    notify({
+                                        kind: 'ok',
+                                        title: '策略監控條件成立！',
+                                        body: `(測試) ${t.code} 滿足條件：\n${formatTargetConditions(t)}\n發出警示！`
+                                    });
+                                }}
+                                title="發送測試推播"
+                                style={{ cursor: 'pointer', color: '#f0ad4e', background: 'none', border: 'none', padding: 0 }}
+                            >
+                                <Bell size={16} />
+                            </button>
+                            <button 
+                                onClick={() => updateScanTarget(t.id, { repeat: !t.repeat })} 
+                                title={t.repeat ? '切換為單次觸發' : '切換為重複觸發'}
+                                style={{ cursor: 'pointer', color: t.repeat ? '#4CAF50' : '#ccc', background: 'none', border: 'none', padding: 0 }}
+                            >
+                                <Repeat size={16} />
+                            </button>
                             <button onClick={() => toggleScanTargetActive(t.id, !t.active)} style={{ cursor: 'pointer' }}>
                                 {t.active ? <Pause size={16} /> : <Play size={16} />}
                             </button>

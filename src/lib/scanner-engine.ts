@@ -2,7 +2,7 @@ import { retainQuote } from './quote-ownership';
 import { ensureContract } from './contracts-cache';
 import { onAnyTick } from './stream';
 import { notify, placeQuickOrder } from './trade';
-import { getScanTargets, updateScanTarget } from './scanner-store';
+import { getScanTargets, updateScanTarget, formatTargetConditions } from './scanner-store';
 import type { ScanTarget } from './scanner-store';
 import { fetchKbars } from './shioaji';
 import { kbarsToCandles, wallClockToUtc, dateStrOffset, aggregate } from './utils/kbars';
@@ -13,6 +13,7 @@ const retainers = new Map<string, ReturnType<typeof retainQuote>>();
 const lastPrices = new Map<string, number>();
 const targetKbars = new Map<string, Candle[]>();
 let lastTargets: ScanTarget[] = [];
+const targetMetState = new Map<string, boolean>();
 
 // 定期檢查訂閱狀態，同步 store 的變化
 export async function syncScannerSubscriptions() {
@@ -172,23 +173,31 @@ onAnyTick(tick => {
                 }
             }
             
-            if (allMet) {
-                // 1. 觸發後立刻停止監控該條件，避免重複洗單
-                updateScanTarget(t.id, { active: false, status: 'triggered' });
-                scheduleScannerSync();
+            const previouslyMet = targetMetState.get(t.id) || false;
+
+            if (allMet && !previouslyMet) {
+                targetMetState.set(t.id, true);
+
+                if (!t.repeat) {
+                    // 1. 單次觸發：觸發後立刻停止監控該條件，避免重複洗單
+                    updateScanTarget(t.id, { active: false, status: 'triggered' });
+                    scheduleScannerSync();
+                }
                 
                 const actionText = t.action === 'trade' ? '並已嘗試送單' : '發出警示';
                 
                 notify({
                     kind: 'ok',
                     title: '策略監控條件成立！',
-                    body: `${t.code} 現價 ${price} 滿足多重條件，${actionText}！`
+                    body: `${t.code} 現價 ${price} 滿足條件：\n${formatTargetConditions(t)}\n${actionText}！`
                 });
                 
                 // 2. 如果動作是交易，則送出市價委託
                 if (t.action === 'trade' && t.quantity) {
                     executeTrade(t, price);
                 }
+            } else if (!allMet) {
+                targetMetState.set(t.id, false);
             }
         }
     }
