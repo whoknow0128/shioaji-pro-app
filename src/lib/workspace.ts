@@ -71,7 +71,8 @@ export type BlockType =
     | 'signals'
     | 'optpnl'
     | 'backtest'
-    | 'assistant';
+    | 'assistant'
+    | 'scanner';
 
 // 'industries' 區塊已移出市場脈動（產業地圖歸產業全景面板）— 舊存檔的
 // 'industries' 值由面板端讀時過濾、權重按比例併入其餘區塊
@@ -424,6 +425,14 @@ export const BLOCK_META: Record<
         pinnable: false,
         singleton: true,
         defaultSize: { w: 7, h: 14, minW: 5, minH: 9 },
+    },
+    scanner: {
+        label: '策略監控',
+        description: '指標條件提醒與程式化交易',
+        category: 'tools',
+        pinnable: false,
+        singleton: true,
+        defaultSize: { w: 6, h: 12, minW: 4, minH: 8 },
     },
 };
 

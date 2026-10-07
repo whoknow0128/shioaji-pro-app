@@ -13,6 +13,7 @@ import { initTheme } from './lib/theme-store';
 import { startBracketRuntime } from './lib/bracket';
 import { startOddSpreadService } from './lib/odd-spread-service';
 import { startTriggerEngine } from './lib/trigger-engine';
+import './lib/scanner-engine'; // 載入我們自訂的掃描引擎
 
 initTheme();
 startAnalytics();

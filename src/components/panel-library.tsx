@@ -98,6 +98,7 @@ const PANEL_ICONS: Record<BlockType, LucideIcon> = {
     optpnl: AreaChart,
     backtest: FlaskConical,
     assistant: Bot,
+    scanner: Radio,
 };
 
 const ALL_TYPES = Object.keys(BLOCK_META) as BlockType[];

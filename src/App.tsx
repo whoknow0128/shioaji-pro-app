@@ -48,6 +48,7 @@ import { PnlPanel } from './components/pnl-panel';
 import { QuoteBoard } from './components/quote-board';
 import { ReplayPanel } from './components/replay-panel';
 import { ScannerPanel } from './components/scanner-panel';
+import { StrategyScannerPanel } from './components/strategy-scanner-panel';
 import { SectorHeatmap } from './components/sector-heatmap';
 import { StockFuturesPanel } from './components/stock-futures-panel';
 import { TickTape } from './components/tick-tape';
@@ -228,6 +229,8 @@ function BlockBody({
             return <Watchlist {...watchlistProps} />;
         case 'movers':
             return <ScannerPanel onPick={onSelectCode} />;
+        case 'scanner':
+            return <StrategyScannerPanel />;
         case 'dock':
             return <BottomDock {...dockProps} />;
         case 'chart':

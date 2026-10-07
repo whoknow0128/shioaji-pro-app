@@ -43,10 +43,15 @@ export function aggregate(candles: Candle[], minutes: number): Candle[] {
     let cur: Candle | null = null;
     const bucketSec = minutes * 60;
     for (const c of candles) {
-        const bucket =
-            minutes >= 1440
-                ? Math.floor(c.time / 86400) * 86400
-                : Math.ceil(c.time / bucketSec) * bucketSec;
+        let bucket: number;
+        if (minutes >= 10080) { // Weekly
+            // Epoch (1970-01-01) is Thursday. Shift by 4 days to align to Monday.
+            bucket = Math.floor((c.time - 4 * 86400) / 604800) * 604800 + 4 * 86400;
+        } else if (minutes >= 1440) { // Daily
+            bucket = Math.floor(c.time / 86400) * 86400;
+        } else { // Intraday
+            bucket = Math.ceil(c.time / bucketSec) * bucketSec;
+        }
         if (!cur || cur.time !== bucket) {
             if (cur) out.push(cur);
             cur = { ...c, time: bucket };
