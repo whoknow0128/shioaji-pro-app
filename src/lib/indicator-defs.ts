@@ -35,9 +35,10 @@ export interface ParamDef {
     key: string;
     label: string;
     def: number;
-    min: number;
-    max: number;
+    min?: number;
+    max?: number;
     step?: number;
+    options?: { value: number; label: string }[];
 }
 
 export interface OutputDef {
@@ -101,6 +102,51 @@ export const INDICATOR_DEFS: IndicatorDef[] = [
         params: [{ key: 'period', label: '週期', def: 20, min: 1, max: 500 }],
         outputs: [{ key: 'line', label: 'WMA', kind: 'line', color: '#b06fff' }],
         compute: (b, p) => ({ line: wma(b, p.period!) }),
+    },
+    {
+        type: 'multima',
+        label: '多重移動平均',
+        short: 'MMA',
+        desc: '同時顯示多條移動平均線 (MA5, MA10, MA20, MA60, MA100, MA200)',
+        aliases: ['mma', 'multiple moving average', '多重均線'],
+        category: 'overlay',
+        params: [
+            {
+                key: 'maType',
+                label: '均線類型',
+                def: 0,
+                options: [
+                    { value: 0, label: 'SMA (簡單)' },
+                    { value: 1, label: 'EMA (指數)' },
+                ],
+            },
+            { key: 'p1', label: 'MA1', def: 5, min: 1, max: 500 },
+            { key: 'p2', label: 'MA2', def: 10, min: 1, max: 500 },
+            { key: 'p3', label: 'MA3', def: 20, min: 1, max: 500 },
+            { key: 'p4', label: 'MA4', def: 60, min: 1, max: 500 },
+            { key: 'p5', label: 'MA5', def: 100, min: 1, max: 500 },
+            { key: 'p6', label: 'MA6', def: 200, min: 1, max: 500 },
+        ],
+        outputs: [
+            { key: 'ma1', label: 'MA1', kind: 'line', color: '#b06fff' },
+            { key: 'ma2', label: 'MA2', kind: 'line', color: '#ff4d6a' },
+            { key: 'ma3', label: 'MA3', kind: 'line', color: '#3d8bff' },
+            { key: 'ma4', label: 'MA4', kind: 'line', color: '#1fd286' },
+            { key: 'ma5', label: 'MA5', kind: 'line', color: '#e0a43c' },
+            { key: 'ma6', label: 'MA6', kind: 'line', color: '#ff8a3d' },
+        ],
+        compute: (b, p) => {
+            const isEma = p.maType === 1;
+            const fn = isEma ? ema : sma;
+            return {
+                ma1: fn(b, p.p1!),
+                ma2: fn(b, p.p2!),
+                ma3: fn(b, p.p3!),
+                ma4: fn(b, p.p4!),
+                ma5: fn(b, p.p5!),
+                ma6: fn(b, p.p6!),
+            };
+        },
     },
     {
         type: 'boll',

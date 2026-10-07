@@ -550,27 +550,48 @@ export function IndicatorSettingsModal({
                         def.params.map((p) => (
                             <label key={p.key} className={styles.fieldRow}>
                                 <span>{p.label}</span>
-                                <input
-                                    type='number'
-                                    className={styles.fieldInput}
-                                    min={p.min}
-                                    max={p.max}
-                                    step={p.step ?? 1}
-                                    value={inst.params[p.key] ?? p.def}
-                                    onChange={(e) => {
-                                        const v = Number(e.target.value);
-                                        if (!Number.isFinite(v)) return;
-                                        onPatch({
-                                            params: {
-                                                ...inst.params,
-                                                [p.key]: Math.min(
-                                                    p.max,
-                                                    Math.max(p.min, v),
-                                                ),
-                                            },
-                                        });
-                                    }}
-                                />
+                                {p.options ? (
+                                    <select
+                                        className={styles.fieldInput}
+                                        value={inst.params[p.key] ?? p.def}
+                                        onChange={(e) => {
+                                            onPatch({
+                                                params: {
+                                                    ...inst.params,
+                                                    [p.key]: Number(e.target.value),
+                                                },
+                                            });
+                                        }}
+                                    >
+                                        {p.options.map((opt) => (
+                                            <option key={opt.value} value={opt.value}>
+                                                {opt.label}
+                                            </option>
+                                        ))}
+                                    </select>
+                                ) : (
+                                    <input
+                                        type='number'
+                                        className={styles.fieldInput}
+                                        min={p.min}
+                                        max={p.max}
+                                        step={p.step ?? 1}
+                                        value={inst.params[p.key] ?? p.def}
+                                        onChange={(e) => {
+                                            const v = Number(e.target.value);
+                                            if (!Number.isFinite(v)) return;
+                                            onPatch({
+                                                params: {
+                                                    ...inst.params,
+                                                    [p.key]: Math.min(
+                                                        p.max ?? Infinity,
+                                                        Math.max(p.min ?? -Infinity, v),
+                                                    ),
+                                                },
+                                            });
+                                        }}
+                                    />
+                                )}
                             </label>
                         ))}
                     {tab === 'style' && (
