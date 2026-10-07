@@ -20,6 +20,7 @@ export function StrategyScannerPanel() {
     const [kdPeriod, setKdPeriod] = useState('9');
     const [timeframe, setTimeframe] = useState('1');
     const [repeat, setRepeat] = useState(false);
+    const [session, setSession] = useState<'all'|'day'|'night'>('all');
 
     const handleAddCondition = () => {
         const needsThreshold = ['above', 'below', 'kd_k_cross_up', 'kd_k_cross_down', 'kd_d_cross_up', 'kd_d_cross_down', 'ma_above', 'ma_below', 'kd_k_above', 'kd_k_below', 'kd_d_above', 'kd_d_below'].includes(conditionType);
@@ -51,6 +52,7 @@ export function StrategyScannerPanel() {
             active: true,
             quantity: action === 'trade' ? Number(quantity) : undefined,
             repeat,
+            session,
         });
         
         setCode('');
@@ -173,7 +175,7 @@ export function StrategyScannerPanel() {
             {stagedConditions.length > 0 && (
                 <div style={{ padding: '8px', border: '1px solid #ccc', marginBottom: '16px', borderRadius: '4px' }}>
                     <div style={{ marginBottom: '8px', fontWeight: 'bold', fontSize: '13px' }}>2. 觸發動作</div>
-                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
                         <select value={action} onChange={e => setAction(e.target.value as any)} style={{ padding: '4px' }}>
                             <option value="alert">僅提醒</option>
                             <option value="trade">自動下單(買進)</option>
@@ -188,6 +190,12 @@ export function StrategyScannerPanel() {
                                 style={{ width: '60px', padding: '4px' }}
                             />
                         )}
+
+                        <select value={session} onChange={e => setSession(e.target.value as any)} style={{ padding: '4px' }}>
+                            <option value="all">全盤</option>
+                            <option value="day">僅日盤</option>
+                            <option value="night">僅夜盤</option>
+                        </select>
 
                         <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '13px' }}>
                             <input type="checkbox" checked={repeat} onChange={e => setRepeat(e.target.checked)} />
@@ -207,7 +215,12 @@ export function StrategyScannerPanel() {
                 {targets.map(t => (
                     <div key={t.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px', border: '1px solid #ccc', borderRadius: '4px' }}>
                         <div>
-                            <strong>{t.code}</strong> - {formatTargetConditions(t)}
+                            <strong>
+                                {t.session === 'day' ? '(僅日盤) ' : t.session === 'night' ? '(僅夜盤) ' : ''}
+                                {t.code}
+                            </strong> 
+                            {t.id.startsWith('file-') && <span style={{ fontSize: '11px', background: '#e0e0e0', padding: '2px 4px', borderRadius: '4px', margin: '0 4px' }}>檔案配置</span>}
+                            - {formatTargetConditions(t)}
                             <span style={{ marginLeft: '8px', fontSize: '12px', color: t.action === 'trade' ? '#d9534f' : '#5bc0de' }}>
                                 [{t.action === 'trade' ? `自動買進 ${t.quantity} 張` : '提醒'}{t.repeat ? ' / 重複' : ' / 單次'}]
                             </span>
@@ -239,9 +252,11 @@ export function StrategyScannerPanel() {
                             <button onClick={() => toggleScanTargetActive(t.id, !t.active)} style={{ cursor: 'pointer' }}>
                                 {t.active ? <Pause size={16} /> : <Play size={16} />}
                             </button>
-                            <button onClick={() => removeScanTarget(t.id)} style={{ cursor: 'pointer', color: '#d9534f' }}>
-                                <Trash2 size={16} />
-                            </button>
+                            {!t.id.startsWith('file-') && (
+                                <button onClick={() => removeScanTarget(t.id)} style={{ cursor: 'pointer', color: '#d9534f', background: 'none', border: 'none', padding: 0 }}>
+                                    <Trash2 size={16} />
+                                </button>
+                            )}
                         </div>
                     </div>
                 ))}

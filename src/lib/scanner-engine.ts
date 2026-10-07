@@ -7,9 +7,12 @@ import type { ScanTarget } from './scanner-store';
 import { fetchKbars } from './shioaji';
 import { kbarsToCandles, wallClockToUtc, dateStrOffset, aggregate } from './utils/kbars';
 import { sma, stoch } from './indicators';
+import { isDaySessionTick, filterDaySession } from './intraday-session';
 import type { Candle } from './types/market';
+import type { SecurityType } from './types/contract';
 
 const retainers = new Map<string, ReturnType<typeof retainQuote>>();
+const targetSecTypes = new Map<string, SecurityType>();
 const lastPrices = new Map<string, number>();
 const targetKbars = new Map<string, Candle[]>();
 let lastTargets: ScanTarget[] = [];
@@ -26,6 +29,7 @@ export async function syncScannerSubscriptions() {
             release();
             retainers.delete(code);
             targetKbars.delete(code);
+            targetSecTypes.delete(code);
         }
     }
     
@@ -40,6 +44,7 @@ export async function syncScannerSubscriptions() {
                 const contract = await ensureContract(code);
                 if (retainers.has(code)) { // double check
                     retainers.set(code, retainQuote(contract, 'Tick'));
+                    targetSecTypes.set(code, contract.security_type);
                 }
                 
                 // 若策略有任一條件需要指標，依據最大的 timeframe 載入適當天數的歷史 K 線
@@ -86,31 +91,33 @@ onAnyTick(tick => {
     const prevPrice = lastPrices.get(tick.code);
     lastPrices.set(tick.code, price);
     
+    let tickSec = 0;
+    if (tick.date && tick.time) {
+        const tickTimeStr = `${tick.date} ${tick.time.substring(0, 8)}`;
+        const parsed = wallClockToUtc(tickTimeStr);
+        if (!Number.isNaN(parsed)) tickSec = parsed;
+    }
+    
     const candles = targetKbars.get(tick.code);
     
     // Update live 1-min candle if exists
-    if (candles && tick.date && tick.time) {
-        // time like "09:12:30.123" -> wallClockToUtc needs "YYYY-MM-DD HH:MM:SS"
-        const tickTimeStr = `${tick.date} ${tick.time.substring(0, 8)}`;
-        const tickSec = wallClockToUtc(tickTimeStr);
-        if (!Number.isNaN(tickSec)) {
-            const bucket = Math.ceil(tickSec / 60) * 60;
-            let last = candles[candles.length - 1];
-            
-            if (!last || last.time < bucket) {
-                last = { time: bucket, open: price, high: price, low: price, close: price, volume: tick.volume || 0 };
-                candles.push(last);
-            } else if (last.time === bucket) {
-                last.high = Math.max(last.high, price);
-                last.low = Math.min(last.low, price);
-                last.close = price;
-                last.volume += tick.volume || 0;
-            }
-            
-            // Keep memory bounded
-            if (candles.length > 1500) {
-                candles.splice(0, 500);
-            }
+    if (candles && tickSec > 0) {
+        const bucket = Math.ceil(tickSec / 60) * 60;
+        let last = candles[candles.length - 1];
+        
+        if (!last || last.time < bucket) {
+            last = { time: bucket, open: price, high: price, low: price, close: price, volume: tick.volume || 0 };
+            candles.push(last);
+        } else if (last.time === bucket) {
+            last.high = Math.max(last.high, price);
+            last.low = Math.min(last.low, price);
+            last.close = price;
+            last.volume += tick.volume || 0;
+        }
+        
+        // Keep memory bounded
+        if (candles.length > 1500) {
+            candles.splice(0, 500);
         }
     }
 
@@ -118,7 +125,19 @@ onAnyTick(tick => {
     for (const t of lastTargets) {
         if (t.code === tick.code && t.active && t.status === 'monitoring' && t.conditions && t.conditions.length > 0) {
             
+            const secType = targetSecTypes.get(t.code);
+            if (secType && tickSec > 0 && t.session && t.session !== 'all') {
+                const isDay = isDaySessionTick(secType, tickSec);
+                if (t.session === 'day' && !isDay) continue;
+                if (t.session === 'night' && isDay) continue;
+            }
+
             let allMet = true;
+            
+            let currentCandles = candles;
+            if (currentCandles && secType && t.session === 'day') {
+                currentCandles = filterDaySession(secType, currentCandles);
+            }
             
             for (const cond of t.conditions) {
                 let met = false;
@@ -126,10 +145,10 @@ onAnyTick(tick => {
                     met = (prevPrice <= (cond.threshold || 0) && price > (cond.threshold || 0));
                 } else if (cond.type === 'below' && prevPrice !== undefined) {
                     met = (prevPrice >= (cond.threshold || 0) && price < (cond.threshold || 0));
-                } else if (['ma_cross_up', 'ma_cross_down', 'ma_above', 'ma_below'].includes(cond.type) && candles) {
+                } else if (['ma_cross_up', 'ma_cross_down', 'ma_above', 'ma_below'].includes(cond.type) && currentCandles) {
                     const timeframe = Number(cond.params?.timeframe || 1);
                     const period = Number(cond.params?.ma_period || 5);
-                    const aggCandles = aggregate(candles, timeframe);
+                    const aggCandles = aggregate(currentCandles, timeframe);
                     const ma = sma(aggCandles, period);
                     if (ma.length >= 2 && prevPrice !== undefined) {
                         const prevMa = ma[ma.length - 2]?.value;
@@ -141,10 +160,10 @@ onAnyTick(tick => {
                             else if (cond.type === 'ma_below') met = (price < currMa);
                         }
                     }
-                } else if (['kd_cross_up', 'kd_cross_down', 'kd_k_cross_up', 'kd_k_cross_down', 'kd_d_cross_up', 'kd_d_cross_down', 'kd_k_above', 'kd_k_below', 'kd_d_above', 'kd_d_below'].includes(cond.type) && candles) {
+                } else if (['kd_cross_up', 'kd_cross_down', 'kd_k_cross_up', 'kd_k_cross_down', 'kd_d_cross_up', 'kd_d_cross_down', 'kd_k_above', 'kd_k_below', 'kd_d_above', 'kd_d_below'].includes(cond.type) && currentCandles) {
                     const timeframe = Number(cond.params?.timeframe || 1);
                     const period = Number(cond.params?.kd_period || 9);
-                    const aggCandles = aggregate(candles, timeframe);
+                    const aggCandles = aggregate(currentCandles, timeframe);
                     const { k, d } = stoch(aggCandles, period, 3, 3);
                     if (k.length >= 2 && d.length >= 2) {
                         const prevK = k[k.length - 2]?.value;

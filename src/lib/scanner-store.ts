@@ -1,8 +1,9 @@
 import { useSyncExternalStore } from 'react';
+import fileStrategiesData from '../config/strategies.json';
 
 export interface ScanCondition {
     id: string; // 單一條件的唯一 ID
-    type: string; // 條件類型: 'above', 'below', 'ma_cross_up', 'ma_cross_down', 'kd_cross_up', 'kd_cross_down', 'kd_k_cross_up', 'kd_k_cross_down', 'kd_d_cross_up', 'kd_d_cross_down', 'ma_above', 'ma_below', 'kd_k_above', 'kd_k_below', 'kd_d_above', 'kd_d_below'
+    type: string; // 條件類型
     threshold?: number;
     params?: Record<string, any>; // timeframe, ma_period, kd_period
 }
@@ -16,6 +17,7 @@ export interface ScanTarget {
     status: 'monitoring' | 'triggered' | 'error'; // 當前狀態
     quantity?: number; // 若為 trade，代表下單數量
     repeat?: boolean; // 是否允許重複觸發
+    session?: 'all' | 'day' | 'night'; // 期貨監控時段
 }
 
 const STORAGE_KEY = 'sj-pro-scanner-targets';
@@ -31,12 +33,43 @@ function loadTargets() {
                 targets = parsed;
             } else {
                 targets = []; // Discard old format
-                saveTargets();
             }
         }
     } catch {
         // storage not available
     }
+
+    // Merge file strategies
+    const fileStrategies = fileStrategiesData as unknown as ScanTarget[];
+    const fileIds = new Set(fileStrategies.map(f => f.id));
+    
+    // Remove old file strategies from localStorage that are no longer in file
+    targets = targets.filter(t => !t.id.startsWith('file-') || fileIds.has(t.id));
+
+    // Update or insert file strategies
+    for (const fs of fileStrategies) {
+        const existing = targets.find(t => t.id === fs.id);
+        if (existing) {
+            // Keep active and status from localStorage, but overwrite everything else from file
+            Object.assign(existing, {
+                code: fs.code,
+                conditions: fs.conditions,
+                action: fs.action,
+                quantity: fs.quantity,
+                repeat: fs.repeat,
+                session: fs.session
+            });
+        } else {
+            const defaultActive = fs.active !== undefined ? fs.active : true;
+            targets.push({
+                ...fs,
+                active: defaultActive,
+                status: defaultActive ? 'monitoring' : 'triggered'
+            } as ScanTarget);
+        }
+    }
+
+    saveTargets();
 }
 
 function saveTargets() {
