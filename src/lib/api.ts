@@ -175,10 +175,12 @@ async function runWithTimeout<T>(
 // shioaji errors come back as JSON: {"code":400,"message":"...","details":...}
 // surface that message instead of a bare "400 Bad Request" — the message is
 // what tells you it's CA / unsigned account / bad params (issue #1 support)
-async function throwApiError(res: Response): Promise<never> {
+async function throwApiError(res: Response, reqBody?: unknown): Promise<never> {
     let detail = '';
+    let rawBody = '';
     try {
-        const data = (await res.json()) as {
+        rawBody = await res.text();
+        const data = JSON.parse(rawBody) as {
             message?: string;
             details?: unknown;
         };
@@ -191,6 +193,7 @@ async function throwApiError(res: Response): Promise<never> {
     } catch {
         // non-JSON body — fall back to status text
     }
+    console.error('API Error Response:', res.status, rawBody, 'Request Body:', reqBody);
     throw Object.assign(
         new Error(`${res.status} ${detail || res.statusText}`.trim()),
         { status: res.status },
@@ -200,6 +203,7 @@ async function throwApiError(res: Response): Promise<never> {
 export async function apiGet<T>(path: string, opts?: { signal?: AbortSignal; headers?: HeadersInit }): Promise<T> {
     const res = await doFetch(base() + path, opts);
     if (!res.ok) await throwApiError(res);
+
     return res.json() as Promise<T>;
 }
 
@@ -289,7 +293,7 @@ export async function apiPost<T>(
             headers,
         });
         opts?.onResponse?.(res);
-        if (!res.ok) await throwApiError(res);
+        if (!res.ok) await throwApiError(res, body);
         return res.json() as Promise<T>;
     }
     const timedMutation = path === '/api/v1/order/place_order' || path === '/api/v1/order/cancel_order';
@@ -301,7 +305,7 @@ export async function apiPost<T>(
             signal,
         }, beforeDispatch);
         opts?.onResponse?.(res);
-        if (!res.ok) await throwApiError(res);
+        if (!res.ok) await throwApiError(res, body);
         return res.json() as Promise<T>;
     }, opts?.timeoutMs ?? (timedMutation ? 3000 : undefined), timedMutation);
 }
