@@ -247,6 +247,12 @@ export async function apiPost<T>(
             { mutationNotStarted: true },
         );
     }
+    if (!isTauri && harnessEnabled && AGENT_HARNESS_MUTATIONS.has(path)) {
+        throw Object.assign(
+            new Error('為確保安全，Agent Harness 啟用時不允許透過瀏覽器直接下單，請使用桌面版 App (Tauri) 進行測試。'),
+            { mutationNotStarted: true },
+        );
+    }
     // Serialize once in the WebView, then let the native bridge sign and send
     // these exact bytes. The native bridge fails closed when Harness is absent
     // or disabled; it never falls back to an unsigned protected mutation.

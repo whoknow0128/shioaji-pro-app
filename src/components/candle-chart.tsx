@@ -543,13 +543,14 @@ export function CandleChart({
                             body: `${c.code} ${qty}${odd ? ' 股（零股）' : ''} @ ${fmtPrice(price)} (${trade.status.status})`,
                         }),
                     )
-                    .catch((e) =>
+                    .catch((e) => {
+                        if (e instanceof Error && e.name === 'OrderConfirmCancelled') return;
                         notify({
                             kind: 'err',
                             title: '圖表下單失敗',
                             body: e instanceof Error ? e.message : String(e),
-                        }),
-                    );
+                        });
+                    });
                 return;
             }
             // stop / take triggers — direction inferred from click vs last

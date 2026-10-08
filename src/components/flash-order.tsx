@@ -673,6 +673,7 @@ export function FlashOrder({
             });
             onOrdersChangedRef.current?.();
         } catch (e) {
+            if (e instanceof Error && e.name === 'OrderConfirmCancelled') return;
             if (accountChangedBeforeSend(e)) notifyAccountChangedBeforeSend();
             else notify({ kind: 'err', title: '⚡ 閃電下單失敗', body: e instanceof Error ? e.message : String(e) });
         } finally {
