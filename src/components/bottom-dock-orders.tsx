@@ -38,6 +38,7 @@ import {
     type MarketFilter,
     type ViewMode,
 } from './bottom-dock-shared';
+import { orderStatusLabel } from '../lib/order-status-label';
 
 type StatusFilter = 'active' | 'filled' | 'dead' | 'all';
 const STATUS_FILTERS = ['active', 'filled', 'dead', 'all'] as const;
@@ -237,6 +238,8 @@ export function OrdersPane({
     onChanged,
     onSelectCode,
     onShowAll,
+    showAllRequest,
+    onShowAllRequestHandled,
 }: {
     trades: Trade[];
     initialStatus: 'loading' | 'failed' | 'ready';
@@ -248,6 +251,9 @@ export function OrdersPane({
     onSelectCode: (code: string) => void;
     // 重設市場/帳戶範圍（由 dock 持有那兩個 state）
     onShowAll?: () => void;
+    /** non-zero: show every status once (待確認卡「開啟委託查詢」, #201 ③) */
+    showAllRequest?: number;
+    onShowAllRequestHandled?: () => void;
 }) {
     const { ref: measureRef, width } = useMeasuredWidth();
     const size = sizeClassOf(width);
@@ -257,6 +263,11 @@ export function OrdersPane({
         STATUS_FILTERS,
         'active',
     );
+    useEffect(() => {
+        if (!showAllRequest) return;
+        setStatusFilter('all');
+        onShowAllRequestHandled?.();
+    }, [showAllRequest, setStatusFilter, onShowAllRequestHandled]);
     const [armed, setArmed] = useState(false);
     const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
     const [busy, setBusy] = useState<{ done: number; total: number } | null>(
@@ -511,12 +522,12 @@ export function OrdersPane({
                             <td className={styles.td}>{fillCell(t)}</td>
                             <td className={styles.td}>
                                 <span
-                                    title={`券商原始狀態 ${st}；原始量 ${t.order.quantity}；成交 ${t.status.deal_quantity}；取消 ${t.status.cancel_quantity}`}
+                                    title={`狀態 ${orderStatusLabel(st)}；原始量 ${t.order.quantity}；成交 ${t.status.deal_quantity}；取消 ${t.status.cancel_quantity}`}
                                     className={
                                         styles.statusChip[statusKind(st)]
                                     }
                                 >
-                                    {ACTIVE_STATUSES.has(st) && remainingWorkingOrderQuantity(t) === 0 ? '無未成交量' : st}
+                                    {ACTIVE_STATUSES.has(st) && remainingWorkingOrderQuantity(t) === 0 ? '無未成交量' : orderStatusLabel(st)}
                                 </span>
                             </td>
                             {size === 'wide' && (
@@ -574,10 +585,10 @@ export function OrdersPane({
                             </span>
                             <span className={styles.cardSpacer} />
                             <span
-                                title={`券商原始狀態 ${st}；原始量 ${t.order.quantity}；成交 ${t.status.deal_quantity}；取消 ${t.status.cancel_quantity}`}
+                                title={`狀態 ${orderStatusLabel(st)}；原始量 ${t.order.quantity}；成交 ${t.status.deal_quantity}；取消 ${t.status.cancel_quantity}`}
                                 className={styles.statusChip[statusKind(st)]}
                             >
-                                {ACTIVE_STATUSES.has(st) && remainingWorkingOrderQuantity(t) === 0 ? '無未成交量' : st}
+                                {ACTIVE_STATUSES.has(st) && remainingWorkingOrderQuantity(t) === 0 ? '無未成交量' : orderStatusLabel(st)}
                             </span>
                         </div>
                         <div className={styles.cardLine}>
