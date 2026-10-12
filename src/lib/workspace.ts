@@ -1,6 +1,7 @@
 // src/lib/workspace.ts — dynamic panel blocks + grid layout + named profiles
 
 import type { LayoutItem } from 'react-grid-layout';
+import { isLinkGroup, LINK_GROUPS, type LinkGroupId } from './flash-link';
 
 // 版面座標底座（儲存基準）：288 欄 = 傳統 24 欄 × 12。
 // - 撰寫/舊存檔仍是 24 欄語意，載入時 ×12 無損升階
@@ -89,6 +90,18 @@ export interface Block {
     pin: string | null;
     // 閃電下單面板自己的帳戶（每市場一組 key）— 沒有 key 的市場跟隨主畫面
     flashAccounts?: import('./flash-account').FlashAccountKeys;
+    // 閃電下單面板自己的單位（整股／盤中零股），換股票不變；缺省 = 設為預設的單位
+    flashLot?: import('./flash-account').FlashLot;
+    // 閃電下單「記住數量」：張／股／口各一個數量；false = 使用者關閉，缺省 = 預設開啟
+    flashQty?: import('./flash-qty-memory').FlashQtySetting;
+    // 閃電下單面板自己的信用條件（整股：現股／融資／融券／借券／借券豁免＋現股當沖先賣），換股票不變；缺省 = 現股
+    flashCredit?: import('./flash-account').FlashCredit;
+    // 閃電下單面板自己的委託條件（效期／期貨倉別／範圍市價），換商品不變；缺省 = ROD、自動、市價
+    flashOrder?: import('./flash-account').FlashOrderOpts;
+    // 連動群組 A／B／C（pin 為 null 時才有效）：群組成員共用 Workspace.linkGroups 的代碼
+    linkGroup?: import('./flash-link').LinkGroupId;
+    // 閃電下單的對應商品（照選取／現股／個股期＋規格月份＋價差對照）；缺省 = 照選取
+    flashLink?: import('./flash-link').FlashLink;
     // Market-pulse presets can open multiple panels on distinct views.
     pulseVisualization?: 'distribution' | 'flow';
     pulseSections?: PulseSection[];
@@ -104,15 +117,67 @@ export interface Block {
     intradaySession?: 'auto' | 'day' | 'night';
     // K 線圖下單設定（#204，每市場一組）— 跟版面一起持久化
     chartOrder?: import('./chart-order-settings').ChartOrderPanelState;
+    // K 棒讀值列（開高低收，#240）— false = 隱藏；缺省 = 顯示
+    chartOhlc?: boolean;
 }
 
 export interface Workspace {
     blocks: Block[];
     layout: LayoutItem[];
+    // 連動群組各自的代碼（跟版面一起存）
+    linkGroups?: Partial<Record<LinkGroupId, string>>;
+}
+
+// ---- 連動群組 ----
+export type LinkMode = 'main' | 'pin' | LinkGroupId;
+
+// 連動群組這版只給閃電下單（其他面板的送單閘門不含群組身分）
+export function blockLinkMode(block: Block): LinkMode {
+    if (block.pin) return 'pin';
+    return block.type === 'flash' && isLinkGroup(block.linkGroup) ? block.linkGroup : 'main';
+}
+
+/** 面板的來源代碼：鎖定代碼、群組代碼；null = 跟自選選取 */
+export function blockSourceCode(block: Block, w: Workspace): string | null {
+    const mode = blockLinkMode(block);
+    if (mode === 'pin') return block.pin;
+    if (mode === 'main') return null;
+    return w.linkGroups?.[mode] ?? null;
+}
+
+/** 切換連動方式。加入沒人用的群組時以面板目前的代碼當群組代碼 */
+export function withLinkMode(w: Workspace, id: string, mode: LinkMode, currentCode: string | null): Workspace {
+    if (mode === 'pin' && !currentCode) return w;
+    if (isLinkGroup(mode) && w.blocks.find((b) => b.id === id)?.type !== 'flash') return w;
+    const linkGroups = { ...w.linkGroups };
+    const unused = isLinkGroup(mode) && !w.blocks.some((b) => b.id !== id && blockLinkMode(b) === mode);
+    if (isLinkGroup(mode) && currentCode && (!linkGroups[mode] || unused)) linkGroups[mode] = currentCode;
+    return {
+        ...w,
+        linkGroups,
+        blocks: w.blocks.map((b) => {
+            if (b.id !== id) return b;
+            const { linkGroup: _g, ...rest } = b;
+            return isLinkGroup(mode) ? { ...rest, pin: null, linkGroup: mode } : { ...rest, pin: mode === 'pin' ? currentCode : null };
+        }),
+    };
+}
+
+/** 群組換代碼：所有成員同一次一起換 */
+export function withGroupCode(w: Workspace, group: LinkGroupId, code: string): Workspace {
+    return { ...w, linkGroups: { ...w.linkGroups, [group]: code } };
+}
+
+export function linkGroupSummary(w: Workspace): { id: LinkGroupId; code: string | null; count: number }[] {
+    return LINK_GROUPS.map((id) => ({
+        id,
+        code: w.linkGroups?.[id] ?? null,
+        count: w.blocks.filter((b) => blockLinkMode(b) === id).length,
+    }));
 }
 
 export type SessionConfigPatch = Partial<
-    Pick<Block, 'chartSession' | 'intradaySession' | 'chartOrder'>
+    Pick<Block, 'chartSession' | 'intradaySession' | 'chartOrder' | 'chartOhlc'>
 >;
 
 // 開彈出視窗時把面板的時段選擇帶進 URL（session=…）

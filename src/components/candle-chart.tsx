@@ -24,6 +24,7 @@ import {
     ArrowDown,
     ArrowUp,
     Bell,
+    ChartCandlestick,
     Copy,
     Crosshair,
     Eye,
@@ -86,9 +87,17 @@ import { canUpdateOrderPrice } from '../lib/odd-lot';
 import { resetEscCancelArm } from '../lib/esc-cancel-arm';
 import { baseMode, getChartColors, useThemeSettings, themeKey as themeKeyOf } from '../lib/theme-store';
 import { notify, placeQuickOrder } from '../lib/trade';
+import { captureServerMode } from '../lib/server-info-store';
+import { creditEnquireCond, creditSideBlocks, creditStatus, prepareCreditOrder, useCreditEnquire, type CreditCheck } from '../lib/credit-eligibility';
+import { creditLabel } from '../lib/odd-lot';
+import { octypeLabel, quickOrderNote } from '../lib/order-conditions';
 import { ORDER_CONTEXT_CHANGED_MESSAGE, useOrderContext } from '../hooks/use-order-context';
 import {
     chartModeHint,
+    chartActionCredit,
+    chartCreditTag,
+    chartEffective,
+    chartExitBlocked,
     chartPlaceOptions,
     chartTriggerFields,
     loadChartOrderDefault,
@@ -124,7 +133,9 @@ import {
     kbarsToCandles,
     wallClockToUtc
 } from '../lib/utils/kbars';
-import { roundToTick } from '../lib/utils/ticksize';
+import { roundToTick, tickDecimals, tickSizeFor } from '../lib/utils/ticksize';
+import { createOhlcStore } from '../lib/ohlc-legend';
+import { OhlcLegend } from './ohlc-legend';
 import * as styles from './candle-chart.css';
 import { ChartDrawingOverlays, ChartDrawingTools, ChartObjectList } from './chart-drawing-tools';
 import { toolDef } from '../lib/chart-drawings';
@@ -169,6 +180,8 @@ export function CandleChart({
     onSessionModeChange,
     orderSettings: orderSettingsProp,
     onOrderSettingsChange,
+    showOhlc: showOhlcProp,
+    onShowOhlcChange,
 }: {
     panelId?: string;
     contract: ContractBase;
@@ -183,6 +196,10 @@ export function CandleChart({
     // 一起存；沒有時（彈出視窗）只在元件內
     orderSettings?: ChartOrderPanelState;
     onOrderSettingsChange?: (next: ChartOrderPanelState) => void;
+    // K 棒讀值列（開高低收，#240）：有 onShowOhlcChange（主視窗 block）時
+    // 跟版面一起存；沒有時（彈出視窗）只在元件內。缺省 = 顯示
+    showOhlc?: boolean;
+    onShowOhlcChange?: (show: boolean) => void;
 }) {
     const hostRef = useRef<HTMLDivElement>(null);
     const chartRef = useRef<IChartApi | null>(null);
@@ -205,6 +222,15 @@ export function CandleChart({
         setLocalSessionMode(m);
         onSessionModeChange?.(m);
     };
+    const [localShowOhlc, setLocalShowOhlc] = useState(showOhlcProp ?? true);
+    const showOhlc = onShowOhlcChange ? showOhlcProp !== false : localShowOhlc;
+    const toggleOhlc = () => {
+        setLocalShowOhlc(!showOhlc);
+        onShowOhlcChange?.(!showOhlc);
+    };
+    // 讀值列自己訂閱這個 store：讀值變動只重繪讀值列
+    const ohlcStore = useMemo(createOhlcStore, []);
+    const [hostWidth, setHostWidth] = useState(0);
     const [empty, setEmpty] = useState(false);
     const [loading, setLoading] = useState(false);
     const [historyError, setHistoryError] = useState(false);
@@ -286,7 +312,31 @@ export function CandleChart({
     };
     const orderSettingsRef = useRef(orderSettings);
     orderSettingsRef.current = orderSettings;
-    const captureContext = useOrderContext(contract, orderSettings.lot);
+    // 點下去實際套用的條件（零股只用 ROD＋現股；設定保留，切回整股恢復）
+    const orderEff = chartEffective(orderSettings, orderMarket ?? 'S');
+    const creditApplies = orderMarket === 'S' && orderSettings.lot === 'Common';
+    // 可否融資券：與閃電共用（只在融資／融券時查，當日快取；確定是 0 才擋，查詢失敗不擋）
+    const creditCond = creditApplies ? creditEnquireCond(orderEff.credit) : null;
+    const creditEnquiry = useCreditEnquire(contract, creditCond !== null);
+    const creditCheck: CreditCheck = creditCond === null ? 'ok'
+        : creditEnquiry.loading ? 'loading' : creditEnquiry.failed ? 'unknown' : creditStatus(creditEnquiry.row, creditCond);
+    const creditSides = creditSideBlocks(contract as { code: string; day_trade?: string }, orderEff.credit, creditCheck);
+    const exitBlocked = orderMarket ? chartExitBlocked(orderSettings, orderMarket) : null;
+    const creditTagText = chartCreditTag(orderEff.credit);
+    // 設定面板信用列下的一句話（同閃電的提示）
+    const creditStatusNote: { text: string; bad: boolean } | undefined = !creditApplies || !creditTagText ? undefined
+        : creditSides.creditBlocked || creditSides.dayTradeBlocked ? { text: (creditSides.creditBlocked ?? creditSides.dayTradeBlocked)!, bad: true }
+            : creditCheck === 'unknown' ? { text: '無法確認可否融資券（不擋單，由券商端決定）', bad: false }
+                : creditCheck === 'loading' ? { text: '確認可否融資券中…', bad: false }
+                    : creditSides.sellOnly ? { text: `${creditTagText}：只能點價賣（${creditTagText}賣出）；點價買停用`, bad: false }
+                        : undefined;
+    // 送單時的固定規則（融券不能買、不可當沖）；可否融資券在點擊時重新查詢
+    const creditRuleRef = useRef(creditSides.rule);
+    creditRuleRef.current = creditSides.rule;
+    // 委託條件的鍵：換信用、當沖、效期、倉別、單位任何一項都算換條件
+    const conditionKey = `${orderSettings.lot}:${orderEff.credit.cond}:${orderEff.credit.daytradeShort ? 'dt' : ''}:${orderEff.orderType}:${orderEff.octype ?? ''}`;
+    // 確認視窗開著時條件改變（換回來也一樣）：那筆不送（同閃電）
+    const captureContext = useOrderContext(contract, conditionKey);
     // 帳號：沒固定就跟隨主畫面；固定的帳號不可用時絕不改用別的帳號
     const accountState = useAccounts();
     const privacy = usePrivacyMode();
@@ -301,6 +351,51 @@ export function CandleChart({
     }, [accountState, orderMarket, orderSettings.accountKey, privacy]);
     const orderAccountRef = useRef(orderAccountView);
     orderAccountRef.current = orderAccountView;
+    // 點價買賣（一次性）：條件取點下去當下的設定；信用檢查、確認後重查、送出前
+    // 檢查都沿用閃電的共用函式（credit-eligibility／placeQuickOrder）
+    const sendPointOrder = async (
+        c: ContractBase, action: 'Buy' | 'Sell', price: number, settings: ChartOrderSettings, market: ChartOrderMarket,
+        account: Account, isAccountCurrent: () => boolean,
+    ) => {
+        const isContextCurrent = captureContext();
+        const qty = settings.qty;
+        const odd = market === 'S' && settings.lot === 'IntradayOdd';
+        const eff = chartEffective(settings, market);
+        const creditOn = market === 'S' && !odd;
+        const label = creditOn ? chartActionCredit(eff.credit, action) : '';
+        try {
+            // 不能用的一邊不送（不會改成現股）
+            const ruleBlock = creditOn ? creditRuleRef.current[action] : null;
+            if (ruleBlock) throw new Error(ruleBlock);
+            // 伺服器模式在點下去的當下（任何等待之前）就固定
+            const serverMode = captureServerMode();
+            const gate = creditOn ? await prepareCreditOrder(c, action, eff.credit) : null;
+            if (gate?.afterConfirm && !isContextCurrent()) throw new Error(ORDER_CONTEXT_CHANGED_MESSAGE);
+            const trade = await placeQuickOrder(c, action, price, qty, {
+                ...chartPlaceOptions(settings, market), account, isAccountCurrent, serverMode,
+                ...(gate?.afterConfirm ? { afterConfirm: gate.afterConfirm } : {}),
+                beforeSend: () => {
+                    if (!isContextCurrent()) throw new Error(ORDER_CONTEXT_CHANGED_MESSAGE);
+                    gate?.check();
+                    // 確認期間合約更新（例如變成不可當沖）：照目前的規則再看一次
+                    const nowBlocked = creditOn ? creditRuleRef.current[action] : null;
+                    if (nowBlocked) throw new Error(nowBlocked);
+                    if (!isAccountCurrent()) throw new Error('帳戶已變更，已停止後續下單');
+                },
+            });
+            const conditions = quickOrderNote({ market: false, futures: market === 'F', orderType: eff.orderType, octype: eff.octype });
+            notify({
+                kind: 'ok',
+                title: `📈 圖表${label}${action === 'Buy' ? '買進' : '賣出'}已送出`,
+                body: `${c.code} ${qty}${odd ? ' 股（零股）' : ''} @ ${fmtPrice(price)}${conditions ? ` · ${conditions}` : ''} (${trade.status.status})`,
+            });
+        } catch (e) {
+            if (e instanceof Error && e.name === 'OrderConfirmCancelled') return;
+            notify({ kind: 'err', title: '圖表下單失敗', body: e instanceof Error ? e.message : String(e) });
+        }
+    };
+    const sendPointOrderRef = useRef(sendPointOrder);
+    sendPointOrderRef.current = sendPointOrder;
     // 組合商品（合成合約）只能用組合單下單 — 圖上禁用交易模式
     const isCombo = Boolean((contract as { combo?: unknown }).combo);
     // 在點價/停損/停利模式中切到組合商品 → 強制回觀察，殘留的交易
@@ -348,6 +443,9 @@ export function CandleChart({
         >(),
     );
     const legendRafRef = useRef(false);
+    // 同一個 frame 內多次 crosshair 事件只處理最後一次（游標停下時讀值
+    // 對準游標最後所在的 K 棒）
+    const crosshairParamRef = useRef<MouseEventParams | null>(null);
     // sub-pane layout memory: instId -> pane index（上次重建的配置）與
     // instId -> 高度 px（使用者拖出來的上下圖比例，重建時還原）
     const paneAssignRef = useRef(new Map<string, number>());
@@ -387,11 +485,23 @@ export function CandleChart({
     const modeRef = useRef(mode);
     modeRef.current = mode;
     const armedDrawingSequenceRef = useRef<number | null>(null);
+    // 武裝時的商品與委託條件：任何一項改變（含外部改變，例如切換版面）就在
+    // 同一次 render 解除點價／停損停利，不等 effect（同閃電）
+    const tradeKey = `${contract.security_type}:${contract.code}:${conditionKey}`;
+    const armedTradeKeyRef = useRef(tradeKey);
     const setTradeMode = (next: TradeMode) => {
         modeRef.current = next;
+        armedTradeKeyRef.current = tradeKey;
         armedDrawingSequenceRef.current = next === 'observe' ? null : drawingsRef.current?.interactionSequence() ?? null;
         setMode(next);
     };
+    if (mode !== 'observe' && mode !== 'alert' && armedTradeKeyRef.current !== tradeKey) {
+        modeRef.current = 'observe';
+        armedDrawingSequenceRef.current = null;
+        setMode('observe');
+    }
+    // 這次 render 的模式（解除的那次 render 不再顯示提示）
+    const shownMode: TradeMode = mode !== 'observe' && mode !== 'alert' && armedTradeKeyRef.current !== tradeKey ? 'observe' : mode;
     const contractRef = useRef(contract);
     contractRef.current = contract;
     const lastPriceRef = useRef<number | null>(null);
@@ -435,7 +545,12 @@ export function CandleChart({
                 };
             });
         });
-        setLegendValues(out);
+        // 沒有指標時游標移動不必重繪整張圖表元件
+        setLegendValues((prev) =>
+            legendMetaRef.current.size === 0 && Object.keys(prev).length === 0
+                ? prev
+                : out,
+        );
     };
     const updateLegendRef = useRef(updateLegend);
     updateLegendRef.current = updateLegend;
@@ -530,27 +645,7 @@ export function CandleChart({
             // (optional) confirmation returns
             const isAccountCurrent = () => accountMatches(orderAccountRef.current.active, account);
             if (m === 'buy' || m === 'sell') {
-                const action = m === 'buy' ? 'Buy' : 'Sell';
-                const isContextCurrent = captureContext();
-                placeQuickOrder(c, action, price, qty, { ...chartPlaceOptions(settings, market), account, isAccountCurrent, beforeSend: () => {
-                    if (!isContextCurrent()) throw new Error(ORDER_CONTEXT_CHANGED_MESSAGE);
-                    if (!isAccountCurrent()) throw new Error('帳戶已變更，已停止後續下單');
-                } })
-                    .then((trade) =>
-                        notify({
-                            kind: 'ok',
-                            title: `📈 圖表${action === 'Buy' ? '買進' : '賣出'}已送出`,
-                            body: `${c.code} ${qty}${odd ? ' 股（零股）' : ''} @ ${fmtPrice(price)} (${trade.status.status})`,
-                        }),
-                    )
-                    .catch((e) => {
-                        if (e instanceof Error && e.name === 'OrderConfirmCancelled') return;
-                        notify({
-                            kind: 'err',
-                            title: '圖表下單失敗',
-                            body: e instanceof Error ? e.message : String(e),
-                        });
-                    });
+                void sendPointOrderRef.current(c, m === 'buy' ? 'Buy' : 'Sell', price, settings, market, account as Account, isAccountCurrent);
                 return;
             }
             // stop / take triggers — direction inferred from click vs last
@@ -575,6 +670,12 @@ export function CandleChart({
                     quantity: 0,
                     kind: 'alert',
                 });
+                return;
+            }
+            // 停損停利只送現股：信用條件生效時不建立（按鈕已停用，這裡再擋一次）
+            const exitBlock = chartExitBlocked(settings, market);
+            if (exitBlock) {
+                notify({ kind: 'err', title: '無法掛觸價單', body: exitBlock });
                 return;
             }
             const fields = chartTriggerFields(settings, market);
@@ -604,12 +705,19 @@ export function CandleChart({
 
         chart.subscribeCrosshairMove((param) => {
             // legend value readout follows the crosshair（rAF-throttled）
+            crosshairParamRef.current = param;
             if (!legendRafRef.current) {
                 legendRafRef.current = true;
                 requestAnimationFrame(() => {
                     legendRafRef.current = false;
-                    updateLegendRef.current(
-                        param.point ? param : undefined,
+                    const p = crosshairParamRef.current;
+                    const hovering = p?.point ? p : undefined;
+                    updateLegendRef.current(hovering);
+                    // K 棒讀值：游標所在 K 棒；離開圖表／不在 K 棒上 → 最新一根
+                    ohlcStore.hover(
+                        hovering && typeof hovering.time === 'number'
+                            ? hovering.time
+                            : null,
                     );
                 });
             }
@@ -684,6 +792,31 @@ export function CandleChart({
             })),
         );
     }, [themeKey]);
+
+    // K 棒讀值：歷史載入／換商品／換週期後重算
+    useEffect(() => {
+        ohlcStore.bump();
+    }, [dataVersion, ohlcStore]);
+
+    // 圖表寬度 → 讀值列完整／縮短（窄面板不讓讀值擋住 K 棒）
+    useEffect(() => {
+        const host = hostRef.current;
+        if (!host || typeof ResizeObserver === 'undefined') return;
+        const ro = new ResizeObserver((entries) => {
+            const w = Math.round(entries[0]?.contentRect.width ?? 0);
+            setHostWidth((prev) => (prev === w ? prev : w));
+        });
+        ro.observe(host);
+        return () => ro.disconnect();
+    }, []);
+    // 讀值小數位依跳動價位；指數沒有跳動價位，固定兩位（與價格軸一致）
+    const ohlcDecimals = useMemo(
+        () => (price: number) =>
+            contract.security_type === 'IND'
+                ? 2
+                : tickDecimals(tickSizeFor(contract, price)),
+        [contract],
+    );
 
     // load kbars on symbol/timeframe change; pages of older history are
     // pulled on demand by the visible-range subscription (loadMoreRef)
@@ -929,6 +1062,7 @@ export function CandleChart({
             // a rejected update (e.g. timestamp older than the series tail)
             // must never take the app down — history reload will resync
         }
+        ohlcStore.bump(); // K 棒讀值跟著最新成交
         // 歷史載入失敗後 live bar 已開始堆 — 圖上有東西就不該再掛
         // 「無 K 線資料」（同值 setState React 會 bail out）
         setEmpty(false);
@@ -1325,7 +1459,8 @@ export function CandleChart({
                     lineWidth: 2,
                     lineStyle: 0, // solid
                     axisLabelVisible: true,
-                    title: `${t.order.action === 'Buy' ? '買' : '賣'}${remaining} ⠿`,
+                    // 非現股的委託標出信用條件（融資買2、現沖賣1）
+                    title: `${creditLabel(t.order.action, t.order.order_cond, t.order.daytrade_short) ?? ''}${t.order.action === 'Buy' ? '買' : '賣'}${remaining} ⠿`,
                 }),
             );
         }
@@ -1827,6 +1962,8 @@ export function CandleChart({
             paneTops[inst.id] === undefined
         );
     });
+    // 交易／畫圖模式提示往下讓出 K 棒讀值那一列，兩者都看得到
+    const hintStyle = showOhlc ? { top: 30 } : undefined;
     return (
         <div className={styles.wrap}
             onPointerDownCapture={() => { if (panelService && panelId) panelService.focus(panelId); }}
@@ -1865,24 +2002,41 @@ export function CandleChart({
                 >
                     <Maximize2 size={12} />
                 </button>
+                <button
+                    className={styles.iconBtnToggle[showOhlc ? 'on' : 'off']}
+                    onClick={toggleOhlc}
+                    title={showOhlc ? 'K 棒讀值（開高低收）：顯示中 — 點擊隱藏' : 'K 棒讀值（開高低收）：已隱藏 — 點擊顯示'}
+                    aria-label='K 棒讀值'
+                    aria-pressed={showOhlc}
+                >
+                    <ChartCandlestick size={12} />
+                </button>
                 <span className={styles.toolbarDivider} />
                 {TRADE_MODES.filter(
                     // 組合商品只能用組合單下單 — 圖上僅保留警示，
                     // 點價買賣與觸價停損停利（flat code 會被 server 拒）
                     // 一律不給
                     (m) => !isCombo || m.key === 'alert',
-                ).map((m) => (
+                ).map((m) => {
+                    // 這張圖的條件不能送的一邊停用並說明（不會改成現股送出）
+                    const blocked = m.key === 'buy' ? creditSides.buy
+                        : m.key === 'sell' ? creditSides.sell
+                            : m.key === 'stop' || m.key === 'take' ? exitBlocked : null;
+                    const off = !!blocked && creditApplies;
+                    return (
                     <button
                         key={m.key}
-                        className={styles.modeBtn[mode === m.key ? 'armed' : 'normal']}
-                        title={`交易模式：${m.label}`}
+                        className={styles.modeBtn[shownMode === m.key ? 'armed' : 'normal']}
+                        disabled={off || undefined}
+                        title={off ? `${m.label}停用：${blocked}` : `交易模式：${m.label}`}
                         // 再按一次退出交易模式。頂端不再有「游標」按鈕，
                         // 這是留在頂端的解除方式（另一個是點左側工具列）
-                        onClick={() => setTradeMode(mode === m.key ? 'observe' : m.key)}
+                        onClick={() => { if (!off) setTradeMode(shownMode === m.key ? 'observe' : m.key); }}
                     >
                         {m.label}
                     </button>
-                ))}
+                    );
+                })}
                 {orderMarket && !isCombo && (
                     <ChartOrderButton
                         market={orderMarket}
@@ -1894,6 +2048,12 @@ export function CandleChart({
                             notify({ kind: 'info', title: '已設為圖表下單預設', body: `新開的${orderMarket === 'F' ? '期貨' : '股票'}圖表使用這組設定（不含帳號）；其他現有圖表維持原設定。` });
                         }}
                         account={orderAccountView}
+                        disabled={creditApplies && !!(creditSides.creditBlocked || creditSides.dayTradeBlocked)}
+                        credit={orderMarket === 'S' ? {
+                            suspended: creditApplies ? null : '零股只能以現股買賣，不能融資、融券或當沖；切回整股時恢復這張圖的信用設定。',
+                            dayTradeOk: (contract as { day_trade?: string }).day_trade === 'Yes',
+                            ...(creditStatusNote ? { status: creditStatusNote } : {}),
+                        } : undefined}
                         contractLabel={`${contract.code}${(contract as { name?: string }).name ? ` ${(contract as { name?: string }).name}` : ''}`}
                     />
                 )}
@@ -1950,20 +2110,30 @@ export function CandleChart({
                             className={panel.mono} />
                     </div>
                 )}
-                {mode !== 'observe' && (
-                    <div className={styles.modeHint}>
-                        交易模式 · {chartModeHint(mode, orderSettings, orderMarket ?? 'S')}
+                {shownMode !== 'observe' && (
+                    <div className={styles.modeHint} style={hintStyle}>
+                        交易模式 · {chartModeHint(shownMode, orderSettings, orderMarket ?? 'S')}
                     </div>
                 )}
                 {mode === 'observe' && drawings.tool && (
-                    <div className={styles.drawHint}>
+                    <div className={styles.drawHint} style={hintStyle}>
                         畫圖模式 · {toolDef(drawings.tool).label}：{DRAW_HINT[drawings.tool]}（Esc 取消）
                     </div>
                 )}
-                {(workingOrders.length > 0 ||
+                {(showOhlc ||
+                    workingOrders.length > 0 ||
                     triggers.length > 0 ||
                     instances.length > 0) && (
                     <div className={styles.triggerList}>
+                        {showOhlc && (
+                            <OhlcLegend
+                                store={ohlcStore}
+                                getBars={() => barsRef.current}
+                                decimalsFor={ohlcDecimals}
+                                width={hostWidth}
+                                colors={colors}
+                            />
+                        )}
                         {mainLegendInsts.map((inst) =>
                             renderLegendRow(inst),
                         )}

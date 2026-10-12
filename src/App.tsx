@@ -114,16 +114,40 @@ import {
     type PulseSectionWeights,
     type Workspace,
     withBlockPatch,
+    blockLinkMode,
+    blockSourceCode,
+    linkGroupSummary,
+    withGroupCode,
+    withLinkMode,
+    type LinkMode,
 } from './lib/workspace';
+import { isLinkGroup, LINK_GROUPS, normalizeFlashLink, type FlashLink, type LinkGroupId } from './lib/flash-link';
+import { FlashLinkHost } from './components/flash-link-host';
+import { SettingsInfoRow } from './components/chart-order-popover';
 import { mainFlashSelection } from './lib/order-account';
 import {
     flashPopoutParams,
     reseedPopoutFlashAccounts,
     loadPopoutFlashAccounts,
     savePopoutFlashAccounts,
+    loadPopoutFlashLot,
+    savePopoutFlashLot,
+    loadPopoutFlashQty,
+    savePopoutFlashQty,
+    loadPopoutFlashCredit,
+    savePopoutFlashCredit,
+    loadPopoutFlashOrder,
+    savePopoutFlashOrder,
     touchPopoutFlashAccounts,
     type FlashAccountKeys,
+    type FlashLot,
+    type FlashCredit,
+    type FlashOrderOpts,
+    DEFAULT_ORDER_OPTS,
+    CASH_CREDIT,
 } from './lib/flash-account';
+import { loadFlashOrderDefault } from './lib/chart-order-settings';
+import type { FlashQtySetting } from './lib/flash-qty-memory';
 
 const POPOUT_TYPES: ReadonlySet<string> = new Set([
     'chart',
@@ -150,31 +174,34 @@ const popoutChartSession = popoutSession.chartSession;
 const popoutIntradaySession = popoutSession.intradaySession;
 
 // resolves a block's contract: pinned code (contract cache) or global selection
+// sourceCode: the pinned code or the link group's code (null = follow selection)
 function useBlockContract(
     block: Block,
     selected: ContractInfo | null,
+    sourceCode: string | null,
 ): { contract: ContractInfo | null; pinFailed: boolean } {
-    const pinned = useContract(block.pin);
+    const pinned = useContract(sourceCode);
     const [failedPin, setFailedPin] = useState<string | null>(null);
     useEffect(() => {
-        if (block.pin && !pinned) {
+        if (sourceCode && !pinned) {
             let active = true;
             setFailedPin(null);
-            ensureContract(block.pin).catch(() => {
+            ensureContract(sourceCode).catch(() => {
                 if (!active) return;
-                setFailedPin(block.pin);
-                notify({
+                setFailedPin(sourceCode);
+                // 群組代碼在套用前已確認過；只有鎖定代碼在這裡提示
+                if (block.pin) notify({
                     kind: 'err',
                     title: '找不到商品',
-                    body: `代碼 ${block.pin} 無法解析`,
+                    body: `代碼 ${sourceCode} 無法解析`,
                 });
             });
             return () => { active = false; };
         }
-    }, [block.pin, pinned]);
+    }, [sourceCode, pinned, block.pin]);
     return {
-        contract: block.pin ? (pinned ?? null) : selected,
-        pinFailed: !!block.pin && !pinned && failedPin === block.pin,
+        contract: sourceCode ? (pinned ?? null) : blockLinkMode(block) === 'main' ? selected : null,
+        pinFailed: !!sourceCode && !pinned && failedPin === sourceCode,
     };
 }
 
@@ -189,11 +216,23 @@ function BlockBody({
     onPulseConfigChange,
     onWallConfigChange,
     onFlashAccountsChange,
+    onFlashLotChange,
+    onFlashQtyChange,
+    onFlashCreditChange,
+    onFlashOrderChange,
+    onFlashLinkChange,
+    flashTargetRef,
+    groupPending,
     onSessionConfigChange,
     refreshTrading,
+    workspaceGen,
 }: {
     block: Block;
     contract: ContractInfo | null;
+    onFlashLinkChange: (id: string, link: FlashLink) => void;
+    /** 閃電實際下單的合約（彈出視窗用）；暫停時為 null */
+    flashTargetRef: React.MutableRefObject<string | null>;
+    groupPending?: string;
     missingContractPhase: AsyncPhase;
     snapshot?: import('./lib/types/market').Snapshot;
     watchlistProps: React.ComponentProps<typeof Watchlist>;
@@ -211,8 +250,14 @@ function BlockBody({
         rows: number,
     ) => void;
     onFlashAccountsChange: (id: string, keys: FlashAccountKeys) => void;
+    onFlashLotChange: (id: string, lot: FlashLot) => void;
+    onFlashQtyChange: (id: string, qty: FlashQtySetting) => void;
+    onFlashCreditChange: (id: string, credit: FlashCredit) => void;
+    onFlashOrderChange: (id: string, order: FlashOrderOpts) => void;
     onSessionConfigChange: (id: string, patch: SessionConfigPatch) => void;
     refreshTrading: () => void;
+    /** bumps whenever a whole workspace is applied (layout / preset / reset / agent) */
+    workspaceGen: number;
 }) {
     if (contract?.security_type === 'IND' && indexBlockMessage(block.type)) {
         return <IndexBlockUnavailable type={block.type} />;
@@ -249,6 +294,10 @@ function BlockBody({
                         orderSettings={block.chartOrder}
                         onOrderSettingsChange={(chartOrder) =>
                             onSessionConfigChange(block.id, { chartOrder })
+                        }
+                        showOhlc={block.chartOhlc !== false}
+                        onShowOhlcChange={(show) =>
+                            onSessionConfigChange(block.id, { chartOhlc: show ? undefined : false })
                         }
                     />
                 </>
@@ -299,14 +348,36 @@ function BlockBody({
             );
         case 'flash':
             return contract ? (
+                <FlashLinkHost
+                    source={contract}
+                    link={normalizeFlashLink(block.flashLink)}
+                    group={blockLinkMode(block)}
+                    onLinkChange={(link) => onFlashLinkChange(block.id, link)}
+                    targetRef={flashTargetRef}
+                    pending={groupPending}
+                    render={(target, linkProps) => (
                 <LiveFlashOrder
+                    // 套用版面（含同一個 block id）＝重新建立面板：數量依該版面
+                    // 的記住數量還原（關閉則 1），點價下單一律解除
+                    key={workspaceGen}
                     snapshot={snapshot}
-                    contract={contract}
+                    contract={target}
+                    {...linkProps}
                     trades={dockProps.trades}
                     positions={dockProps.positions}
                     onOrdersChanged={dockProps.onTradesChanged}
                     accountKeys={block.flashAccounts}
                     onAccountKeysChange={(keys) => onFlashAccountsChange(block.id, keys)}
+                    lot={block.flashLot}
+                    onLotChange={(flashLot) => onFlashLotChange(block.id, flashLot)}
+                    qtyMemory={block.flashQty}
+                    onQtyMemoryChange={(flashQty) => onFlashQtyChange(block.id, flashQty)}
+                    credit={block.flashCredit}
+                    onCreditChange={(flashCredit) => onFlashCreditChange(block.id, flashCredit)}
+                    orderOpts={block.flashOrder}
+                    onOrderOptsChange={(flashOrder) => onFlashOrderChange(block.id, flashOrder)}
+                />
+                    )}
                 />
             ) : (
                 <BlockPlaceholder phase={missingContractPhase} />
@@ -495,6 +566,13 @@ function comboBlockMessage(type: BlockType): string | null {
 interface BlockViewProps {
     block: Block;
     selected: ContractInfo | null;
+    /** 鎖定或群組代碼；null = 跟自選 */
+    sourceCode: string | null;
+    /** 群組正在查的新代碼 */
+    groupPending?: string;
+    linkGroups: ReturnType<typeof linkGroupSummary>;
+    onLinkMode: (id: string, mode: LinkMode, currentCode: string | null) => void;
+    onGroupCode: (group: LinkGroupId, code: string) => void;
     onPinChange: (id: string, pin: string | null) => void;
     onRemove: (id: string) => void;
     snapshot?: import('./lib/types/market').Snapshot;
@@ -513,14 +591,25 @@ interface BlockViewProps {
         rows: number,
     ) => void;
     onFlashAccountsChange: (id: string, keys: FlashAccountKeys) => void;
+    onFlashLotChange: (id: string, lot: FlashLot) => void;
+    onFlashQtyChange: (id: string, qty: FlashQtySetting) => void;
+    onFlashCreditChange: (id: string, credit: FlashCredit) => void;
+    onFlashOrderChange: (id: string, order: FlashOrderOpts) => void;
+    onFlashLinkChange: (id: string, link: FlashLink) => void;
     onSessionConfigChange: (id: string, patch: SessionConfigPatch) => void;
     refreshTrading: () => void;
+    /** bumps whenever a whole workspace is applied (layout / preset / reset / agent) */
+    workspaceGen: number;
 }
 
 function BlockView(props: BlockViewProps) {
-    const { block, selected, onPinChange, onRemove, ...bodyProps } = props;
-    const { contract, pinFailed } = useBlockContract(block, selected);
-    const missingContractPhase: AsyncPhase = block.pin
+    const { block, selected, sourceCode, groupPending, linkGroups, onLinkMode, onGroupCode, onPinChange, onRemove, ...bodyProps } = props;
+    const { contract, pinFailed } = useBlockContract(block, selected, sourceCode);
+    const flashTargetRef = useRef<string | null>(null);
+    // 每次 render 先清空；只有實際畫出閃電時才填入（來源載入中或暫停時彈出不帶舊合約）
+    flashTargetRef.current = null;
+    const linkMode = blockLinkMode(block);
+    const missingContractPhase: AsyncPhase = sourceCode
         ? pinFailed ? 'error' : 'loading'
         : bodyProps.watchlistProps.loading && bodyProps.watchlistProps.items.length === 0
             ? 'loading' : 'idle';
@@ -542,6 +631,13 @@ function BlockView(props: BlockViewProps) {
                 pin={block.pin}
                 currentCode={selected?.code ?? null}
                 onPinChange={(pin) => onPinChange(block.id, pin)}
+                link={block.type !== 'flash' ? undefined : {
+                    mode: linkMode,
+                    groups: linkGroups,
+                    // 目前的來源代碼：鎖定／群組用自己的代碼（即使合約還在載入），跟自選才用選取
+                    onMode: (mode) => onLinkMode(block.id, mode, sourceCode ?? contract?.code ?? null),
+                    onGroupCode,
+                }}
                 onRemove={() => {
                     // 整零價差執行在主視窗服務背景追蹤，關閉面板不會中斷；仍先提醒
                     if (block.type === 'oddspread' && hasLiveSpreadExecution()
@@ -552,26 +648,29 @@ function BlockView(props: BlockViewProps) {
                     POPOUT_TYPES.has(block.type)
                         ? () => {
                               const global = mainFlashSelection();
+                              // 彈出視窗沿用這個面板的單位（從沒選過＝設為預設的單位）
+                              const flashSeed = { lot: block.flashLot ?? loadFlashOrderDefault('S').lot, qty: block.flashQty, credit: block.flashCredit ?? CASH_CREDIT, order: block.flashOrder ?? DEFAULT_ORDER_OPTS };
                               const flashParams = block.type === 'flash'
-                                  ? flashPopoutParams(block.flashAccounts, global, `panel:${block.id}:${contract?.code ?? ''}`)
+                                  ? flashPopoutParams(block.flashAccounts, global, `panel:${block.id}:${flashTargetRef.current ?? ''}`, flashSeed)
                                   : undefined;
                               void openPopout(
                                   block.type,
-                                  contract?.code ?? null,
+                                  // 閃電：彈出實際下單的合約（對應商品之後），固定不跟群組
+                                  block.type === 'flash' ? flashTargetRef.current : contract?.code ?? null,
                                   // popout 開啟時固定帳戶：面板自己的選擇，跟隨主畫面的市場
                                   // 則取此刻主畫面的選擇（popout 不會即時跟隨）
                                   {
                                       ...popoutSessionParam(block),
                                       ...flashParams,
                                   },
-                                  flashParams ? () => reseedPopoutFlashAccounts(flashParams.win, block.flashAccounts, global) : undefined,
+                                  flashParams ? () => reseedPopoutFlashAccounts(flashParams.win, block.flashAccounts, global, { lot: flashSeed.lot, credit: flashSeed.credit, order: flashSeed.order }) : undefined,
                               );
                           }
                         : undefined
                 }
             />
             <PanelErrorBoundary label={meta.label}>
-                <BlockBody {...bodyProps} block={block} contract={contract} missingContractPhase={missingContractPhase} />
+                <BlockBody {...bodyProps} block={block} contract={contract} missingContractPhase={missingContractPhase} flashTargetRef={flashTargetRef} groupPending={groupPending} />
             </PanelErrorBoundary>
         </section>
     );
@@ -606,6 +705,12 @@ function PopoutView({
     const popoutPositionsState = { data: trading.positions, refresh: tradingActionObserved };
     // popout 不在 workspace 裡 — 帳戶依視窗 id 存在本機（開啟時由開啟端固定並預先寫入）
     const [flashAccounts, setFlashAccounts] = useState(() => loadPopoutFlashAccounts(POPOUT_WINDOW_ID));
+    // 單位同樣依視窗 id 存（開啟端預先寫入面板的單位），重新整理後保留
+    const [flashLot, setFlashLot] = useState(() => loadPopoutFlashLot(POPOUT_WINDOW_ID));
+    const [flashQty, setFlashQty] = useState(() => loadPopoutFlashQty(POPOUT_WINDOW_ID));
+    // 信用條件也依視窗 id 存（開啟端預先寫入面板的條件），重新整理後保留
+    const [flashCredit, setFlashCredit] = useState(() => loadPopoutFlashCredit(POPOUT_WINDOW_ID));
+    const [flashOrder, setFlashOrder] = useState(() => loadPopoutFlashOrder(POPOUT_WINDOW_ID));
     // heartbeat: a long-open popout must not be evicted as "stale"
     useEffect(() => {
         if (type !== 'flash' || !POPOUT_WINDOW_ID) return;
@@ -692,6 +797,27 @@ function PopoutView({
                             setFlashAccounts(keys);
                             savePopoutFlashAccounts(POPOUT_WINDOW_ID, keys);
                         }}
+                        lot={flashLot}
+                        onLotChange={(lot) => {
+                            setFlashLot(lot);
+                            savePopoutFlashLot(POPOUT_WINDOW_ID, lot);
+                        }}
+                        qtyMemory={flashQty}
+                        onQtyMemoryChange={(qty) => {
+                            setFlashQty(qty);
+                            savePopoutFlashQty(POPOUT_WINDOW_ID, qty);
+                        }}
+                        credit={flashCredit}
+                        onCreditChange={(credit) => {
+                            setFlashCredit(credit);
+                            savePopoutFlashCredit(POPOUT_WINDOW_ID, credit);
+                        }}
+                        orderOpts={flashOrder}
+                        onOrderOptsChange={(order) => {
+                            setFlashOrder(order);
+                            savePopoutFlashOrder(POPOUT_WINDOW_ID, order);
+                        }}
+                        settingsRows={<SettingsInfoRow label='連動' text='彈出視窗固定此商品，不支援群組' />}
                     />
                 );
                 break;
@@ -957,6 +1083,19 @@ function MainApp() {
         setWorkspace(w);
         saveWorkspace(w);
     }, []);
+    // Applying a whole workspace (saved layout, preset, reset, agent command)
+    // rebuilds the flash panels even when block ids repeat, so their quantity
+    // and click-to-trade state come from the applied layout, never the old one.
+    const [workspaceGen, setWorkspaceGen] = useState(0);
+    const workspaceGenRef = useRef(workspaceGen);
+    workspaceGenRef.current = workspaceGen;
+    const replaceWorkspace = useCallback((w: Workspace) => {
+        // ref 同步前進：套用前就發出的群組代碼查詢，晚回來時立刻知道已作廢
+        const next = workspaceGenRef.current + 1;
+        workspaceGenRef.current = next;
+        setWorkspaceGen(next);
+        updateWorkspace(w);
+    }, [updateWorkspace]);
 
     const indicatorService = useMemo(() => new IndicatorInstanceService({
         getWorkspace: () => workspaceRef.current,
@@ -996,7 +1135,10 @@ function MainApp() {
     const onLayoutChange = useCallback(
         (next: Layout) => {
             const fromRender = GRID_LEGACY_SCALE / density; // 12/k，整數
-            const prev = new Map(workspace.layout.map((l) => [l.i, l]));
+            // 讀最新版面：RGL 的 mount 回報可能與面板 mount 時的寫入（例如閃電
+            // 存初始單位）落在同一次 commit，用舊的 closure 會蓋掉那筆寫入
+            const current = workspaceRef.current;
+            const prev = new Map(current.layout.map((l) => [l.i, l]));
             // RGL 在 mount 時必發一次 onLayoutChange（含跨密度舍入後的
             // 座標）— 儲存值渲染後與回報一致的面板保留原值，精細版面
             // 不會只因「開了 app」就被粗化回存
@@ -1024,10 +1166,10 @@ function MainApp() {
                     h: l.h,
                 };
             });
-            if (!changed && stored.length === workspace.layout.length) return;
-            updateWorkspace({ ...workspace, layout: stored });
+            if (!changed && stored.length === current.layout.length) return;
+            updateWorkspace({ ...current, layout: stored });
         },
-        [workspace, updateWorkspace, density],
+        [updateWorkspace, density],
     );
 
     const addBlock = useCallback(
@@ -1052,6 +1194,7 @@ function MainApp() {
                 minH: meta.defaultSize.minH,
             };
             updateWorkspace({
+                ...workspace,
                 blocks: [...workspace.blocks, { id, type, pin: null }],
                 layout: [...workspace.layout, item],
             });
@@ -1128,6 +1271,7 @@ function MainApp() {
             const gone = workspace.blocks.find((b) => b.id === id);
             if (gone) trackActivity('關面板', gone.type);
             updateWorkspace({
+                ...workspace,
                 blocks: workspace.blocks.filter((b) => b.id !== id),
                 layout: workspace.layout.filter((l) => l.i !== id),
             });
@@ -1164,15 +1308,84 @@ function MainApp() {
     // generic per-block field update (persisted with the workspace)
     const patchBlock = useCallback(
         (id: string, patch: Partial<Block>) => {
-            updateWorkspace(withBlockPatch(workspace, id, patch));
+            // read the latest workspace: several panels may patch in one commit
+            // (e.g. flash panels saving their initial unit on mount)
+            updateWorkspace(withBlockPatch(workspaceRef.current, id, patch));
         },
-        [workspace, updateWorkspace],
+        [updateWorkspace],
     );
     const setBlockFlashAccounts = useCallback(
         (id: string, flashAccounts: FlashAccountKeys) =>
             patchBlock(id, { flashAccounts }),
         [patchBlock],
     );
+    const setBlockFlashLot = useCallback(
+        (id: string, flashLot: FlashLot) => patchBlock(id, { flashLot }),
+        [patchBlock],
+    );
+    const setBlockFlashQty = useCallback(
+        (id: string, flashQty: FlashQtySetting) => patchBlock(id, { flashQty }),
+        [patchBlock],
+    );
+    const setBlockFlashCredit = useCallback(
+        (id: string, flashCredit: FlashCredit) => patchBlock(id, { flashCredit }),
+        [patchBlock],
+    );
+    const setBlockFlashOrder = useCallback(
+        (id: string, flashOrder: FlashOrderOpts) => patchBlock(id, { flashOrder }),
+        [patchBlock],
+    );
+    const setBlockFlashLink = useCallback(
+        (id: string, flashLink: FlashLink) => patchBlock(id, { flashLink }),
+        [patchBlock],
+    );
+    // 同一群組連續輸入時只套用最後一次（較早的查詢晚回來不能蓋掉）
+    const groupCodeSeq = useRef<Partial<Record<LinkGroupId, number>>>({});
+    // 群組正在查的新代碼：查詢期間全組閃電暫停（不能啟用、確認中的單作廢）
+    // （記錄所屬版面 generation：套用別的版面後，舊查詢不會暫停新版面）
+    const [groupPending, setGroupPending] = useState<Partial<Record<LinkGroupId, { code: string; seq: number; gen: number }>>>({});
+    useEffect(() => {
+        // 套用新版面：舊版面的群組查詢全部作廢
+        for (const g of LINK_GROUPS) groupCodeSeq.current[g] = (groupCodeSeq.current[g] ?? 0) + 1;
+        setGroupPending({});
+    }, [workspaceGen]);
+    const clearPending = useCallback((group: LinkGroupId, seq?: number) => setGroupPending((p) => {
+        if (!p[group] || (seq !== undefined && p[group]!.seq !== seq)) return p;
+        const { [group]: _gone, ...rest } = p;
+        return rest;
+    }), []);
+    const setBlockLinkMode = useCallback(
+        (id: string, mode: LinkMode, currentCode: string | null) => {
+            const ws = workspaceRef.current;
+            const prev = ws.blocks.find((b) => b.id === id);
+            // 群組成員變動（離開、重新開始）時，該組還在查的代碼作廢，不能事後蓋掉
+            for (const g of [prev ? blockLinkMode(prev) : null, mode]) {
+                if (isLinkGroup(g)) { groupCodeSeq.current[g] = (groupCodeSeq.current[g] ?? 0) + 1; clearPending(g); }
+            }
+            updateWorkspace(withLinkMode(ws, id, mode, currentCode));
+        },
+        [updateWorkspace, clearPending],
+    );
+    // 群組換代碼：先確認代碼存在，再讓全組同一次一起換
+    const setGroupCode = useCallback((group: LinkGroupId, code: string) => {
+        const seq = (groupCodeSeq.current[group] ?? 0) + 1;
+        groupCodeSeq.current[group] = seq;
+        const gen = workspaceGenRef.current;
+        setGroupPending((p) => ({ ...p, [group]: { code, seq, gen } }));
+        ensureContract(code).then(
+            (c) => {
+                clearPending(group, seq);
+                // 期間又輸入了新代碼或套用了別的版面：這次作廢
+                if (groupCodeSeq.current[group] !== seq || workspaceGenRef.current !== gen) return;
+                updateWorkspace(withGroupCode(workspaceRef.current, group, c.code));
+            },
+            () => {
+                clearPending(group, seq);
+                if (groupCodeSeq.current[group] === seq) notify({ kind: 'err', title: '找不到商品', body: `代碼 ${code} 無法解析` });
+            },
+        );
+    }, [updateWorkspace, clearPending]);
+    const linkGroups = useMemo(() => linkGroupSummary(workspace), [workspace]);
     const setBlockSessionConfig = useCallback(
         (id: string, patch: SessionConfigPatch) => {
             updateWorkspace(withBlockSessionConfig(workspace, id, patch));
@@ -1199,14 +1412,14 @@ function MainApp() {
     );
 
     const resetWorkspace = useCallback(() => {
-        updateWorkspace(structuredClone(DEFAULT_WORKSPACE));
-    }, [updateWorkspace]);
+        replaceWorkspace(structuredClone(DEFAULT_WORKSPACE));
+    }, [replaceWorkspace]);
 
     const loadPreset = useCallback(
         (name: string) => {
             const preset = LAYOUT_PRESETS.find((p) => p.name === name);
             if (preset) {
-                updateWorkspace(structuredClone(preset.workspace));
+                replaceWorkspace(structuredClone(preset.workspace));
                 trackActivity('套版面', name);
                 notify({
                     kind: 'info',
@@ -1215,7 +1428,7 @@ function MainApp() {
                 });
             }
         },
-        [updateWorkspace],
+        [replaceWorkspace],
     );
 
     // ---- profiles ----
@@ -1246,7 +1459,7 @@ function MainApp() {
         (name: string) => {
             const p = profiles.find((x) => x.name === name);
             if (p) {
-                updateWorkspace(structuredClone(p.workspace));
+                replaceWorkspace(structuredClone(p.workspace));
                 trackActivity('套版面', name);
                 notify({
                     kind: 'info',
@@ -1255,7 +1468,7 @@ function MainApp() {
                 });
             }
         },
-        [profiles, updateWorkspace],
+        [profiles, replaceWorkspace],
     );
 
     // App-state reads remain available during setup with Harness disabled.
@@ -1284,10 +1497,10 @@ function MainApp() {
                     selectedRef.current = contract;
                     setSelected(contract);
                 },
-                updateWorkspace,
+                updateWorkspace: replaceWorkspace,
                 createPanelId: newBlockId,
         }, { readOnly: !agentHarnessEnabled });
-    }, [agentHarnessEnabled, updateWorkspace]);
+    }, [agentHarnessEnabled, replaceWorkspace]);
 
     const deleteProfile = useCallback(
         (name: string) => {
@@ -1429,10 +1642,15 @@ function MainApp() {
                                 <BlockView
                                     block={block}
                                     selected={selected}
+                                    sourceCode={blockSourceCode(block, workspace)}
+                                    groupPending={(() => { const m = blockLinkMode(block); const p = isLinkGroup(m) ? groupPending[m] : undefined; return p && p.gen === workspaceGen ? p.code : undefined; })()}
+                                    linkGroups={linkGroups}
+                                    onLinkMode={setBlockLinkMode}
+                                    onGroupCode={setGroupCode}
                                     onPinChange={setBlockPin}
                                     onRemove={removeBlock}
                                     snapshot={
-                                        block.pin
+                                        blockLinkMode(block) !== 'main'
                                             ? undefined
                                             : selectedSnapshot
                                     }
@@ -1442,8 +1660,14 @@ function MainApp() {
                                     onPulseConfigChange={setBlockPulseConfig}
                                     onWallConfigChange={setBlockWallConfig}
                                     onFlashAccountsChange={setBlockFlashAccounts}
+                                    onFlashLotChange={setBlockFlashLot}
+                                    onFlashQtyChange={setBlockFlashQty}
+                                    onFlashCreditChange={setBlockFlashCredit}
+                                    onFlashOrderChange={setBlockFlashOrder}
+                                    onFlashLinkChange={setBlockFlashLink}
                                     onSessionConfigChange={setBlockSessionConfig}
                                     refreshTrading={refreshTrading}
+                                    workspaceGen={workspaceGen}
                                 />
                             </div>
                         ))}

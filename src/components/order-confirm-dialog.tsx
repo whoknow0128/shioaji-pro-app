@@ -9,10 +9,12 @@ import { createPortal } from 'react-dom';
 import { useEscClose } from '../hooks/use-esc-close';
 import {
     getPendingOrderConfirm,
+    privacyAccountLabel,
     resolveOrderConfirm,
     subscribeOrderConfirm,
     type OrderConfirmRequest,
 } from '../lib/order-confirm';
+import { usePrivacyMode } from '../lib/privacy';
 import { usePendingPrices } from '../lib/trigger-engine';
 import { fmtPrice } from '../lib/utils/format';
 import * as styles from './order-confirm-dialog.css';
@@ -21,8 +23,11 @@ function ConfirmModal({ request }: { request: OrderConfirmRequest }) {
     // Esc＝取消，走 modal stack（不誤武裝 Esc-Esc 全刪單）
     useEscClose(() => resolveOrderConfirm(false));
     const pendingPrices = usePendingPrices();
+    const priv = usePrivacyMode();
     const livePrice = request.livePriceCode ? pendingPrices[request.livePriceCode] : undefined;
     const dir = request.action === 'Buy' ? ('up' as const) : ('down' as const);
+    // 信用條件寫進動作：融資買進／融券賣出／現沖賣出，不會看起來像現股
+    const actionText = `${request.credit ?? ''}${request.action === 'Buy' ? '買進' : '賣出'}`;
     return createPortal(
         <div
             className={styles.overlay}
@@ -49,10 +54,12 @@ function ConfirmModal({ request }: { request: OrderConfirmRequest }) {
                             {request.simulation ? '模擬環境' : '正式環境'}
                         </span>
                     )}
+                    {request.serverChanged && <span className={styles.note}>伺服器或模式已變更，這筆不會送出，請取消後重新下單</span>}
+                    {request.awaitingMode && <span className={styles.note}>{request.modeUnavailable ? '無法確認伺服器模式（模擬／正式），請取消後重試' : '確認伺服器模式中…'}</span>}
                 </div>
                 <div className={styles.body}>
                     <div className={styles.actionLine[dir]}>
-                        {request.action === 'Buy' ? '買進' : '賣出'}
+                        {actionText}
                         <span className={styles.contractName}>
                             {request.name || request.code}
                         </span>
@@ -79,7 +86,7 @@ function ConfirmModal({ request }: { request: OrderConfirmRequest }) {
                         <div className={styles.detailRow}>
                             <span>帳戶</span>
                             <span className={styles.detailValue}>
-                                {request.accountLabel}
+                                {privacyAccountLabel(request.accountLabel, priv)}
                             </span>
                         </div>
                     )}
@@ -103,10 +110,11 @@ function ConfirmModal({ request }: { request: OrderConfirmRequest }) {
                     </button>
                     <button
                         className={styles.confirmBtn[dir]}
-                        disabled={!!request.livePriceCode && livePrice === undefined}
+                        disabled={(!!request.livePriceCode && livePrice === undefined) || !!request.awaitingMode || request.simulation === null || !!request.serverChanged}
+                        title={request.awaitingMode ? '正在確認伺服器模式（模擬／正式），請稍候' : undefined}
                         onClick={() => resolveOrderConfirm(true)}
                     >
-                        確認{request.action === 'Buy' ? '買進' : '賣出'}
+                        確認{actionText}
                     </button>
                 </div>
             </div>

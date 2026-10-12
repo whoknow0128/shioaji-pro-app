@@ -9,6 +9,7 @@
 // 互動邏輯全部在 hooks/use-chart-drawings.ts。圖示一律用 lucide。
 
 import {
+    BringToFront,
     ChartNoAxesGantt,
     Copy,
     Equal,
@@ -25,6 +26,7 @@ import {
     MoveUpRight,
     Redo2,
     Ruler,
+    SendToBack,
     SeparatorVertical,
     Settings2,
     Slash,
@@ -52,7 +54,10 @@ import {
     DRAWING_GROUPS,
     DRAWING_PALETTE,
     DRAWING_TOOL_DEFS,
+    canSendBehind,
     drawingLabel,
+    isBehindCandles,
+    LINE_WIDTHS,
     fibOptionsOf,
     MAX_DRAWINGS_PER_SYMBOL,
     MAX_TEXT_LENGTH,
@@ -76,7 +81,7 @@ import {
 } from '../lib/chart-drawing-fib';
 import * as styles from './chart-drawing-tools.css';
 
-const WIDTHS = [1, 2, 3, 4];
+const WIDTHS: readonly number[] = LINE_WIDTHS;
 
 export const TOOL_ICON: Record<DrawingToolId, ComponentType<{ size?: number }>> = {
     horizontal: Minus,
@@ -246,8 +251,13 @@ export function Popover({
 }
 
 // 工具列按鈕的提示 — 立即顯示、畫在 body 上（直排工具列會捲動，絕對
-// 定位的提示會被它裁掉）；原生 title 在桌面版 WebView 裡要停很久才出現
+// 定位的提示會被它裁掉）；原生 title 在桌面版 WebView 裡要停很久才出現。
+// 提示掛在 body 上、狀態在父元件，按鈕卸載時（刪除／隱藏物件、按 Delete、
+// 進入畫圖讓浮動工具列收起）不會有 mouseleave — 所以每個按鈕帶一個依
+// 提示 key 固定的 ref，按鈕卸載就收掉自己的提示；按下按鈕也收掉（按下後
+// 內容多半會變，例如鎖定→解鎖，舊提示不該留著）
 interface Tip {
+    key: string;
     text: string;
     x: number;
     y: number;
@@ -256,24 +266,50 @@ interface Tip {
 function useTips() {
     const [tip, setTip] = useState<Tip | null>(null);
     const docRef = useRef<Document | null>(null);
-    const tipProps = (text: string, aria?: string) => ({
-        'aria-label': aria ?? text.split(' — ')[0]!.split('（')[0]!,
-        onMouseEnter: (e: ReactMouseEvent<HTMLElement>) => {
-            const r = e.currentTarget.getBoundingClientRect();
-            docRef.current = e.currentTarget.ownerDocument;
-            setTip({ text, x: r.right + 6, y: r.top + r.height / 2 });
-        },
-        onMouseLeave: () => setTip(null),
-    });
-    const node =
-        tip && docRef.current?.body
-            ? createPortal(
-                  <span role='tooltip' className={styles.tip} style={{ left: tip.x, top: tip.y }}>
-                      {tip.text}
-                  </span>,
-                  docRef.current.body,
-              )
-            : null;
+    // 每個 key 一個固定的 ref callback：React 只在按鈕真的卸載（或換了
+    // key）時才以 null 呼叫，一般重繪不會誤收提示
+    const refs = useRef(new Map<string, (el: HTMLElement | null) => void>());
+    const refFor = (key: string) => {
+        let fn = refs.current.get(key);
+        if (!fn) {
+            fn = (el) => {
+                if (!el) setTip((t) => (t?.key === key ? null : t));
+            };
+            refs.current.set(key, fn);
+        }
+        return fn;
+    };
+    const tipProps = (text: string, aria?: string) => {
+        const key = aria ?? text.split(' — ')[0]!.split('（')[0]!;
+        return {
+            'aria-label': key,
+            ref: refFor(key),
+            onMouseEnter: (e: ReactMouseEvent<HTMLElement>) => {
+                const r = e.currentTarget.getBoundingClientRect();
+                docRef.current = e.currentTarget.ownerDocument;
+                setTip({ key, text, x: r.right + 6, y: r.top + r.height / 2 });
+            },
+            onMouseLeave: () => setTip(null),
+            onPointerDown: () => setTip(null),
+        };
+    };
+    // 點任何地方（開啟彈出面板、選單…）都先收掉提示，提示不會蓋在彈出層上
+    const tipShown = tip !== null;
+    useEffect(() => {
+        const doc = docRef.current;
+        if (!tipShown || !doc?.addEventListener) return;
+        const hide = () => setTip(null);
+        doc.addEventListener('pointerdown', hide, true);
+        return () => doc.removeEventListener('pointerdown', hide, true);
+    }, [tipShown]);
+    const span = tip ? (
+        <span role='tooltip' className={styles.tip} style={{ left: tip.x, top: tip.y }}>
+            {tip.text}
+        </span>
+    ) : null;
+    // 測試（無 DOM）時就地渲染；瀏覽器中 portal 到按鈕所在文件的 body
+    const host = docRef.current?.body;
+    const node = span && host ? createPortal(span, host) : span;
     return { tipProps, tipNode: node, hideTip: () => setTip(null) };
 }
 
@@ -562,6 +598,9 @@ export function ChartDrawingOverlays({ api }: { api: ChartDrawingsApi }) {
     const anyUnlocked = sel.some((d) => !d.locked);
     const style = api.style;
     const full = api.drawings.length + sel.length > MAX_DRAWINGS_PER_SYMBOL;
+    // K 棒前方／後方：文字註記不適用；選取中只要有一個在前方，按鈕就是「移到後方」
+    const layerable = sel.filter(canSendBehind);
+    const allBehind = layerable.length > 0 && layerable.every(isBehindCandles);
 
     return (
         <>
@@ -615,6 +654,19 @@ export function ChartDrawingOverlays({ api }: { api: ChartDrawingsApi }) {
                             onClick={() => setSettingsOpen(true)}
                         >
                             <Settings2 size={13} />
+                        </button>
+                    )}
+                    {layerable.length > 0 && (
+                        <button
+                            className={styles.railBtn[allBehind ? 'on' : 'normal']}
+                            aria-pressed={allBehind}
+                            {...tipProps(
+                                allBehind ? '目前在 K 棒後方 — 點一下移到前方' : '目前在 K 棒前方 — 點一下移到後方',
+                                allBehind ? '移到 K 棒前方' : '移到 K 棒後方',
+                            )}
+                            onClick={api.toggleBehind}
+                        >
+                            {allBehind ? <SendToBack size={13} /> : <BringToFront size={13} />}
                         </button>
                     )}
                     <button
@@ -1343,6 +1395,22 @@ export function ChartObjectList({ api }: { api: ChartDrawingsApi }) {
                             >
                                 {d.hidden ? <EyeOff size={11} /> : <Eye size={11} />}
                             </button>
+                            {canSendBehind(d) && (
+                                <button
+                                    className={isBehindCandles(d) ? styles.iconBtnOn : styles.iconBtn}
+                                    aria-label={isBehindCandles(d) ? `${drawingLabel(d)} 移到 K 棒前方` : `${drawingLabel(d)} 移到 K 棒後方`}
+                                    title={isBehindCandles(d) ? 'K 棒後方（點一下移到前方）' : 'K 棒前方（點一下移到後方）'}
+                                    aria-pressed={isBehindCandles(d)}
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        api.setBehind(d.id, !isBehindCandles(d));
+                                    }}
+                                >
+                                    {isBehindCandles(d) ? <SendToBack size={11} /> : <BringToFront size={11} />}
+                                </button>
+                            )}
+                            {/* 文字註記沒有前後可選：留同寬的空位，各列按鈕才對齊 */}
+                            {!canSendBehind(d) && <span className={styles.iconBtn} aria-hidden style={{ visibility: 'hidden' }} />}
                             <button
                                 className={styles.iconBtn}
                                 aria-label={d.locked ? `解鎖 ${drawingLabel(d)}` : `鎖定 ${drawingLabel(d)}`}
@@ -1371,7 +1439,7 @@ export function ChartObjectList({ api }: { api: ChartDrawingsApi }) {
                 })}
             </div>
             <div className={styles.listFooter}>
-                <span className={styles.hint}>拖曳調整圖層順序；雙擊改名；Shift 點選可多選。</span>
+                <span className={styles.hint}>拖曳調整圖層順序；前方／後方按鈕切換畫在 K 棒前或後；雙擊改名；Shift 點選可多選。</span>
                 <label className={styles.row} style={{ cursor: 'pointer' }}>
                     <input
                         type='checkbox'

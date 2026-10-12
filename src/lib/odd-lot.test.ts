@@ -38,6 +38,53 @@ describe('stockOrderProblem', () => {
     });
 });
 
+describe('stockOrderProblem — whole-lot credit rules (閃電信用條件)', () => {
+    const base = { ...lmt, quantity: 1, order_lot: 'Common' } as const;
+    it('融券／借券 can only sell: a buy with them is refused', () => {
+        for (const cond of ['ShortSelling', 'SBLShort', 'SBLShortPriceExempt']) {
+            expect(odd.stockOrderProblem({ ...base, action: 'Buy', order_cond: cond })).toBe(odd.CREDIT_TEXT.shortBuy);
+            expect(odd.stockOrderProblem({ ...base, action: 'Sell', order_cond: cond })).toBeNull();
+        }
+    });
+    it('融資 and 現股 are allowed on both sides', () => {
+        for (const action of ['Buy', 'Sell'] as const) {
+            expect(odd.stockOrderProblem({ ...base, action, order_cond: 'MarginTrading' })).toBeNull();
+            expect(odd.stockOrderProblem({ ...base, action, order_cond: 'Cash' })).toBeNull();
+            expect(odd.stockOrderProblem({ ...base, action })).toBeNull();
+        }
+    });
+    it('現股當沖先賣 only for a cash whole-lot sell of a day-trade stock', () => {
+        expect(odd.stockOrderProblem({ ...base, action: 'Sell', daytrade_short: true, day_trade: 'Yes' })).toBeNull();
+        expect(odd.stockOrderProblem({ ...base, action: 'Sell', order_cond: 'Cash', daytrade_short: true, day_trade: 'Yes' })).toBeNull();
+        expect(odd.stockOrderProblem({ ...base, action: 'Buy', daytrade_short: true, day_trade: 'Yes' })).toBe(odd.CREDIT_TEXT.daytradeSide);
+        expect(odd.stockOrderProblem({ ...base, action: 'Sell', order_cond: 'MarginTrading', daytrade_short: true, day_trade: 'Yes' })).toBe(odd.CREDIT_TEXT.daytradeCond);
+        for (const day_trade of ['OnlyBuy', 'No', '', undefined]) {
+            expect(odd.stockOrderProblem({ ...base, action: 'Sell', daytrade_short: true, day_trade })).toBe(odd.CREDIT_TEXT.daytradeStock);
+        }
+        expect(odd.stockOrderProblem({ ...base, action: 'Sell', daytrade_short: false, day_trade: 'No' })).toBeNull();
+        // 只限整股：定盤、鉅額不能當沖先賣
+        for (const order_lot of ['Fixing', 'BlockTrade']) {
+            expect(odd.stockOrderProblem({ ...base, order_lot, action: 'Sell', daytrade_short: true, day_trade: 'Yes' })).toBe(odd.CREDIT_TEXT.daytradeLot);
+        }
+    });
+    it('odd lots keep their own (earlier) explanation', () => {
+        expect(odd.stockOrderProblem({ ...base, order_lot: 'IntradayOdd', action: 'Buy', order_cond: 'ShortSelling' })).toBe(odd.ODD_LOT_TEXT.cond);
+    });
+});
+
+describe('placeStockOrder last check — credit', () => {
+    it('refuses 融券買進 and an ineligible 當沖先賣 before anything is sent', async () => {
+        const { placeStockOrder } = await import('./shioaji');
+        const contract = { code: '2330', security_type: 'STK', exchange: 'TSE', day_trade: 'OnlyBuy' } as never;
+        const order = { price: 1000, quantity: 1, price_type: 'LMT', order_type: 'ROD', order_lot: 'Common' } as const;
+        await expect(placeStockOrder(contract, { ...order, action: 'Buy', order_cond: 'ShortSelling' }))
+            .rejects.toMatchObject({ mutationNotStarted: true, message: odd.CREDIT_TEXT.shortBuy });
+        await expect(placeStockOrder(contract, { ...order, action: 'Sell', daytrade_short: true }))
+            .rejects.toMatchObject({ mutationNotStarted: true, message: odd.CREDIT_TEXT.daytradeStock });
+        expect(api.post).not.toHaveBeenCalled();
+    });
+});
+
 describe('units', () => {
     it('labels and converts lots and shares', () => {
         expect(odd.orderQtyUnit(false, 'IntradayOdd')).toBe('股');
@@ -83,6 +130,19 @@ describe('placeStockOrder last check', () => {
             order_lot: 'IntradayOdd', order_cond: 'MarginTrading' })).rejects.toMatchObject({ mutationNotStarted: true, message: odd.ODD_LOT_TEXT.cond });
         await expect(placeStockOrder(contract, { action: 'Sell', price: 0, quantity: 100, price_type: 'MKT', order_type: 'IOC',
             order_lot: 'Odd' })).rejects.toMatchObject({ mutationNotStarted: true, message: odd.ODD_LOT_TEXT.priceType });
+        expect(api.post).not.toHaveBeenCalled();
+    });
+});
+
+describe('placeFuturesOrder last check — order conditions', () => {
+    it('refuses an unknown 倉別／效期／價別 before anything is sent', async () => {
+        const { placeFuturesOrder } = await import('./shioaji');
+        const { ORDER_CONDITION_TEXT } = await import('./order-conditions');
+        const contract = { code: 'TXFR1', security_type: 'FUT', exchange: 'TAIFEX' } as never;
+        await expect(placeFuturesOrder(contract, { action: 'Buy', price: 100, quantity: 1, price_type: 'LMT', order_type: 'ROD', octype: 'Close' as never }))
+            .rejects.toMatchObject({ mutationNotStarted: true, message: ORDER_CONDITION_TEXT.octype });
+        await expect(placeFuturesOrder(contract, { action: 'Buy', price: 0, quantity: 1, price_type: 'MKP2' as never, order_type: 'IOC' }))
+            .rejects.toMatchObject({ mutationNotStarted: true, message: ORDER_CONDITION_TEXT.priceType });
         expect(api.post).not.toHaveBeenCalled();
     });
 });

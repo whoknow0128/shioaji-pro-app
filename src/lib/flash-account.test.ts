@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { accountMatches, flashAccountKey, flashPopoutParams, loadPopoutFlashAccounts, newPopoutWindowId, pinnedFlashAccounts, reseedPopoutFlashAccounts, resolveFlashAccount, savePopoutFlashAccounts, scopedFlashRows, touchPopoutFlashAccounts } from './flash-account';
+import { accountMatches, flashAccountKey, flashPopoutParams, loadPopoutFlashAccounts, loadPopoutFlashCredit, loadPopoutFlashOrder, savePopoutFlashOrder, normalizeFlashOrderOpts, loadPopoutFlashLot, normalizeFlashCredit, savePopoutFlashCredit, savePopoutFlashLot, loadPopoutFlashQty, savePopoutFlashQty, newPopoutWindowId, pinnedFlashAccounts, reseedPopoutFlashAccounts, resolveFlashAccount, savePopoutFlashAccounts, scopedFlashRows, touchPopoutFlashAccounts } from './flash-account';
 import type { Account } from './types/portfolio';
 const a: Account = { account_type: 'F', broker_id: 'B', account_id: 'A', signed: true, person_id: '', username: '' };
 const b = { ...a, account_id: 'B' };
@@ -159,4 +159,117 @@ describe('per-panel flash account (#139)', () => {
         expect(loadPopoutFlashAccounts('theirs')).toEqual({ F: 'F:B:B' });
         expect(loadPopoutFlashAccounts('mine')).toEqual({ F: 'F:B:C' });
     }));
+
+    it('a popout keeps its own unit by window id: seeded from the opening panel, kept on reload and account changes', () => withStorage(() => {
+        const odd = flashPopoutParams({}, main, 'panel:odd:2330', { lot: 'IntradayOdd' });
+        const round = flashPopoutParams({}, main, 'panel:round:2330', { lot: 'Common' });
+        expect(loadPopoutFlashLot(odd.win)).toBe('IntradayOdd');
+        expect(loadPopoutFlashLot(round.win)).toBe('Common');
+        // the popout's own change and later account changes never lose it
+        savePopoutFlashLot(round.win, 'IntradayOdd');
+        savePopoutFlashAccounts(round.win, { F: flashAccountKey(b) });
+        touchPopoutFlashAccounts(round.win);
+        expect(loadPopoutFlashAccounts(round.win)).toEqual({ F: flashAccountKey(b) });
+        expect(loadPopoutFlashLot(round.win)).toBe('IntradayOdd');
+        // merely focusing an open window keeps its unit; a recreated window takes the panel's
+        expect(flashPopoutParams({}, main, 'panel:odd:2330', { lot: 'Common' }).win).toBe(odd.win);
+        expect(loadPopoutFlashLot(odd.win)).toBe('IntradayOdd');
+        reseedPopoutFlashAccounts(odd.win, {}, main, { lot: 'Common' });
+        expect(loadPopoutFlashLot(odd.win)).toBe('Common');
+        // a tile reopened without a panel unit keeps the tile's own unit
+        const tile = flashPopoutParams(undefined, main, 'tile:2330');
+        expect(loadPopoutFlashLot(tile.win)).toBeUndefined();
+        savePopoutFlashLot(tile.win, 'IntradayOdd');
+        reseedPopoutFlashAccounts(tile.win, undefined, main);
+        expect(loadPopoutFlashLot(tile.win)).toBe('IntradayOdd');
+    }));
+    it('ignores a malformed popout unit and an unknown window', () => withStorage(store => {
+        store.set('sj-pro-flash-popout-windows', JSON.stringify({ w: { keys: {}, at: 1, lot: 'Odd' } }));
+        expect(loadPopoutFlashLot('w')).toBeUndefined();
+        expect(loadPopoutFlashLot(null)).toBeUndefined();
+        expect(loadPopoutFlashLot('nope')).toBeUndefined();
+        savePopoutFlashLot(null, 'IntradayOdd');
+        savePopoutFlashLot('fresh', 'IntradayOdd');
+        expect(loadPopoutFlashLot('fresh')).toBe('IntradayOdd');
+        expect(loadPopoutFlashAccounts('fresh')).toEqual({});
+    }));
+    it('a popout keeps its remembered quantities by window id; off is kept as off, tiles keep their own', () => withStorage(() => {
+        const p = flashPopoutParams({}, main, 'panel:q:2330', { lot: 'IntradayOdd', qty: { Common: 3, IntradayOdd: 500 } });
+        expect(loadPopoutFlashQty(p.win)).toEqual({ Common: 3, IntradayOdd: 500 });
+        savePopoutFlashQty(p.win, { Common: 3, IntradayOdd: 200 });
+        savePopoutFlashAccounts(p.win, { F: flashAccountKey(b) });
+        savePopoutFlashLot(p.win, 'Common');
+        expect(loadPopoutFlashQty(p.win)).toEqual({ Common: 3, IntradayOdd: 200 });
+        savePopoutFlashQty(p.win, false);
+        expect(loadPopoutFlashQty(p.win)).toBe(false);
+        // reopening the same window keeps the popout's own setting (off stays off)
+        reseedPopoutFlashAccounts(p.win, {}, main, { lot: 'Common' });
+        expect(loadPopoutFlashQty(p.win)).toBe(false);
+        savePopoutFlashQty(p.win, { F: 2 });
+        reseedPopoutFlashAccounts(p.win, {}, main, { lot: 'IntradayOdd' });
+        expect(loadPopoutFlashQty(p.win)).toEqual({ F: 2 });
+        // a tile reopened without a panel keeps its own
+        const tile = flashPopoutParams(undefined, main, 'tile:2330');
+        expect(loadPopoutFlashQty(tile.win)).toBeUndefined();
+        savePopoutFlashQty(tile.win, { Common: 5 });
+        reseedPopoutFlashAccounts(tile.win, undefined, main);
+        expect(loadPopoutFlashQty(tile.win)).toEqual({ Common: 5 });
+        expect(loadPopoutFlashQty(null)).toBeUndefined();
+        savePopoutFlashQty(null, { Common: 1 });
+    }));
+    it('reads a malformed popout quantity setting as default (on)', () => withStorage(store => {
+        store.set('sj-pro-flash-popout-windows', JSON.stringify({ w: { keys: {}, at: 1, qty: 'bad' }, v: { keys: {}, at: 1, qty: { IntradayOdd: 5000, X: 1 } } }));
+        expect(loadPopoutFlashQty('w')).toEqual({});
+        // raw values are kept; the panel re-checks limits on restore
+        expect(loadPopoutFlashQty('v')).toEqual({ IntradayOdd: 5000 });
+    }));
+    it('a popout keeps its own credit condition by window id, like its unit', () => withStorage(() => {
+        const margin = flashPopoutParams({}, main, 'panel:m:2330', { lot: 'Common', credit: { cond: 'MarginTrading', daytradeShort: false } });
+        expect(loadPopoutFlashCredit(margin.win)).toEqual({ cond: 'MarginTrading', daytradeShort: false });
+        // later unit and account changes keep it; the popout's own change replaces it
+        savePopoutFlashLot(margin.win, 'IntradayOdd');
+        savePopoutFlashAccounts(margin.win, { S: 'S:B:S1' });
+        expect(loadPopoutFlashCredit(margin.win)).toEqual({ cond: 'MarginTrading', daytradeShort: false });
+        savePopoutFlashCredit(margin.win, { cond: 'Cash', daytradeShort: true });
+        expect(loadPopoutFlashCredit(margin.win)).toEqual({ cond: 'Cash', daytradeShort: true });
+        expect(loadPopoutFlashLot(margin.win)).toBe('IntradayOdd');
+        // a recreated window takes the panel's; a tile without one keeps its own
+        reseedPopoutFlashAccounts(margin.win, {}, main, { lot: 'Common', credit: { cond: 'ShortSelling', daytradeShort: false } });
+        expect(loadPopoutFlashCredit(margin.win)).toEqual({ cond: 'ShortSelling', daytradeShort: false });
+        reseedPopoutFlashAccounts(margin.win, {}, main);
+        expect(loadPopoutFlashCredit(margin.win)).toEqual({ cond: 'ShortSelling', daytradeShort: false });
+        expect(loadPopoutFlashCredit(null)).toBeUndefined();
+    }));
+    it('normalizes a stored credit condition: unknown conditions are dropped, 當沖 only with 現股', () => {
+        expect(normalizeFlashCredit({ cond: 'MarginTrading', daytradeShort: false })).toEqual({ cond: 'MarginTrading', daytradeShort: false });
+        expect(normalizeFlashCredit({ cond: 'ShortSelling', daytradeShort: true })).toEqual({ cond: 'ShortSelling', daytradeShort: false });
+        expect(normalizeFlashCredit({ cond: 'SBLShort', daytradeShort: true })).toEqual({ cond: 'SBLShort', daytradeShort: false });
+        expect(normalizeFlashCredit({ cond: 'SBLShortPriceExempt', daytradeShort: false })).toEqual({ cond: 'SBLShortPriceExempt', daytradeShort: false });
+        expect(normalizeFlashCredit({ cond: 'Bogus', daytradeShort: false })).toBeUndefined();
+        expect(normalizeFlashCredit({ cond: 'Cash' })).toEqual({ cond: 'Cash', daytradeShort: false });
+        expect(normalizeFlashCredit('MarginTrading')).toBeUndefined();
+        expect(normalizeFlashCredit(undefined)).toBeUndefined();
+    });
+    it('a popout keeps its own order conditions (效期／倉別／範圍市價) by window id', () => withStorage(() => {
+        const opts = { orderType: 'IOC', octype: 'New', futuresPriceType: 'MKP' } as const;
+        const p = flashPopoutParams({}, main, 'panel:o:TXFR1', { lot: 'Common', order: opts });
+        expect(loadPopoutFlashOrder(p.win)).toEqual(opts);
+        savePopoutFlashLot(p.win, 'IntradayOdd');
+        savePopoutFlashAccounts(p.win, { F: flashAccountKey(b) });
+        expect(loadPopoutFlashOrder(p.win)).toEqual(opts);
+        savePopoutFlashOrder(p.win, { orderType: 'FOK', octype: 'Auto', futuresPriceType: 'MKT' });
+        expect(loadPopoutFlashOrder(p.win)).toEqual({ orderType: 'FOK', octype: 'Auto', futuresPriceType: 'MKT' });
+        reseedPopoutFlashAccounts(p.win, {}, main, { lot: 'Common', order: opts });
+        expect(loadPopoutFlashOrder(p.win)).toEqual(opts);
+        reseedPopoutFlashAccounts(p.win, {}, main);
+        expect(loadPopoutFlashOrder(p.win)).toEqual(opts);
+        expect(loadPopoutFlashOrder(null)).toBeUndefined();
+    }));
+    it('normalizes stored order conditions: unknown values fall back to the defaults', () => {
+        expect(normalizeFlashOrderOpts({ orderType: 'IOC', octype: 'DayTrade', futuresPriceType: 'MKP' })).toEqual({ orderType: 'IOC', octype: 'DayTrade', futuresPriceType: 'MKP' });
+        expect(normalizeFlashOrderOpts({ orderType: 'GTC', octype: 'Close', futuresPriceType: 'LMT' })).toEqual({ orderType: 'ROD', octype: 'Auto', futuresPriceType: 'MKT' });
+        expect(normalizeFlashOrderOpts({ octype: 'New' })).toEqual({ orderType: 'ROD', octype: 'New', futuresPriceType: 'MKT' });
+        expect(normalizeFlashOrderOpts('IOC')).toBeUndefined();
+        expect(normalizeFlashOrderOpts(undefined)).toBeUndefined();
+    });
 });
