@@ -4,7 +4,7 @@
 
 import { useSyncExternalStore } from 'react';
 import { isOddLot, riskLots } from './odd-lot';
-import { getPrivacyMoney, maskMoney } from './privacy';
+import { secretMoney } from './privacy';
 import type { StockOrderLot } from './types/order';
 
 export interface RiskSettings {
@@ -14,6 +14,7 @@ export interface RiskSettings {
     locked: boolean; // manual kill switch — blocks ALL orders
     escCancelAll: boolean; // Esc×2 cancels all working orders — opt-in
     confirmManualOrders: boolean; // 手動下單前跳可視化委託確認 — opt-in
+    orderLineLock: boolean; // 圖上委託線鎖定：不能拖曳改價 — opt-in
 }
 
 const STORAGE_KEY = 'sj-pro-risk';
@@ -30,6 +31,7 @@ function load(): RiskSettings {
                 locked: !!s.locked,
                 escCancelAll: !!s.escCancelAll,
                 confirmManualOrders: !!s.confirmManualOrders,
+                orderLineLock: !!s.orderLineLock,
             };
         }
     } catch {
@@ -42,6 +44,7 @@ function load(): RiskSettings {
         locked: false,
         escCancelAll: false,
         confirmManualOrders: false,
+        orderLineLock: false,
     };
 }
 
@@ -66,7 +69,11 @@ function emit() {
 
 export function setRiskSettings(next: Partial<RiskSettings>) {
     settings = { ...settings, ...next };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    } catch {
+        // 配額滿時本視窗照樣生效，只是重開後不保留。
+    }
     emit();
 }
 
@@ -98,13 +105,7 @@ export function getDailyPnl(): number {
 }
 
 export function useRiskSettings(): RiskSettings {
-    return useSyncExternalStore(
-        (l) => {
-            listeners.add(l);
-            return () => listeners.delete(l);
-        },
-        () => settings,
-    );
+    return useSyncExternalStore(subscribeRiskSettings, getRiskSettings);
 }
 
 // returns an error message when the order must be blocked, null when OK.
@@ -120,9 +121,8 @@ export function checkOrderAllowed(quantity: number, orderLot?: StockOrderLot | s
             : `超過單筆上限 ${settings.maxQty}（本筆 ${quantity}）`;
     }
     if (settings.maxDailyLoss > 0 && dailyPnl <= -settings.maxDailyLoss) {
-        // 這段文字會進 toast 與通知中心：開啟遮金額時不顯示金額
-        const priv = getPrivacyMoney();
-        return `當日虧損 ${maskMoney(String(Math.round(dailyPnl)), priv)} 已達上限 -${maskMoney(String(settings.maxDailyLoss), priv)}，下單封鎖`;
+        // 這段文字會進 toast 與通知中心：開啟遮金額時不顯示金額，之後才開也會重遮（#268）
+        return `當日虧損 ${secretMoney(Math.round(dailyPnl))} 已達上限 -${secretMoney(settings.maxDailyLoss)}，下單封鎖`;
     }
     return null;
 }

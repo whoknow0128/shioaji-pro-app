@@ -6,6 +6,8 @@
     "type": "module",
     "scripts": {
         "dev": "vite",
+        "desktop:dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
+        "desktop:qa": "tauri build --debug --config src-tauri/tauri.dev.conf.json",
         "build": "tsc -b && vite build",
         "test": "vitest run",
         "preview": "vite preview"
@@ -28,6 +30,7 @@
         "lightweight-charts": "^5.2.0",
         "lowlight": "^3.3.0",
         "lucide-react": "^1.17.0",
+        "motion": "13.4.6",
         "react": "^19.2.4",
         "react-dom": "^19.2.4",
         "react-grid-layout": "^2.2.3",

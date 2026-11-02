@@ -12,11 +12,14 @@ import { CandleChart } from './candle-chart';
 import { IntradayChart } from './intraday-chart';
 import { IntradayWallPanel } from './intraday-wall';
 import { ChipsCard } from './chips-card';
+import { CompanyPanel } from './company-panel';
 import { DepthLadder } from './depth-ladder';
 import { MarketPulsePanel, MarketSignalPanel } from './market-pulse-panel';
 import { OptionChain } from './option-chain';
 import { ScannerPanel } from './scanner-panel';
 import { SectorHeatmap } from './sector-heatmap';
+import { ChainMap } from './chain-map';
+import { PortfolioSectorPanel } from './portfolio-sector-panel';
 import { TickTape } from './tick-tape';
 import { VolProfile } from './vol-profile';
 import * as styles from './panel-library.css';
@@ -36,6 +39,8 @@ const NO_CONTRACT_PREVIEWS: Partial<Record<BlockType, () => ReactElement>> = {
     intradaywall: () => <IntradayWallPanel onPick={noop} />,
     movers: () => <ScannerPanel onPick={noop} />,
     heatmap: () => <SectorHeatmap onPick={noop} />,
+    chainmap: () => <ChainMap onPick={noop} />,
+    holdingmap: () => <PortfolioSectorPanel onPick={noop} />,
     pulse: () => <MarketPulsePanel />,
     signals: () => <MarketSignalPanel />,
     optchain: () => <OptionChain onPick={noop} />,
@@ -51,6 +56,7 @@ const CONTRACT_PREVIEWS: Partial<
     depth: (contract) => <DepthLadder contract={contract} code={contract.code} />,
     tape: (contract) => <TickTape contract={contract} />,
     chips: (contract) => <ChipsCard contract={contract} />,
+    company: (contract) => <CompanyPanel contract={contract} />,
     volprofile: (contract) => <VolProfile contract={contract} />,
 };
 

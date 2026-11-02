@@ -1,3 +1,4 @@
+import { operationNotice } from '../test/operation-notice';
 // 閃電下單的委託條件（同下單面板）：點價限價單的效期 ROD／IOC／FOK、期貨
 // 倉別 自動／新倉／平倉／當沖、期貨市價鈕 市價／範圍市價。記在面板上、換商品
 // 保留；不適用的商品類別（零股只能 ROD）停用並說明、回來恢復；非預設才顯示
@@ -6,7 +7,7 @@ import { createElement, useLayoutEffect } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 vi.mock('../hooks/use-flash-ladder', () => ({ useFlashLadder: () => ({ marks: new Map(), protectedQty: 0, background: false }) }));
-vi.mock('../lib/flash-conditional', () => ({ flashStopProtections: async () => ({ stopped: 0, blocked: [], failed: [] }) }));
+vi.mock('../lib/flash-conditional', () => ({ flashStopProtections: async () => ({ stopped: 0, blocked: [], failed: [], restore: [] }) }));
 import type { Account } from '../lib/types/portfolio';
 import type { ContractInfo } from '../lib/types/contract';
 const mocks = vi.hoisted(() => ({ place: vi.fn(), notify: vi.fn(), post: vi.fn(), base: 'fixture', store: new Map<string, string>() }));
@@ -142,8 +143,8 @@ it('futures: 效期 IOC, 倉別 新倉 and 範圍市價 are saved on the panel, 
     expect(mocks.place.mock.calls[0]![4]).toMatchObject({ orderType: 'IOC', ocType: 'New' });
     expect(mocks.place.mock.calls[1]![4]).toMatchObject({ ocType: 'New', futuresPriceType: 'MKP' });
     // the notice names every non-default condition
-    expect(mocks.notify.mock.calls[0]![0].body).toContain('限價 IOC・新倉');
-    expect(mocks.notify.mock.calls[1]![0].body).toContain('範圍市價 IOC・新倉');
+    expect(operationNotice(mocks.notify, '⚡ 賣出已送出').body).toContain('限價 IOC・新倉');
+    expect(operationNotice(mocks.notify, '⚡ 買進已送出').body).toContain('範圍市價 IOC・新倉');
 });
 
 it('futures 當沖 倉別 goes out as DayTrade', async () => {

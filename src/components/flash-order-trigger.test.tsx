@@ -1,3 +1,5 @@
+import '../test/mock-order-reconciliation';
+import { operationNotice } from '../test/operation-notice';
 // #216 閃電下單的觸價單與自動停損停利：觸價模式在點的價位掛觸價單（方向由
 // 成交價決定、反向在持倉內＝出場）、鎖定一起關閉；梯形上的觸價單點一下刪除、
 // 拖曳改價（不能拖過成交價）；自動停損停利讓每筆進場走括號單、減倉照送、
@@ -10,14 +12,16 @@ import type { ContractInfo } from '../lib/types/contract';
 import type { LadderMark } from '../lib/flash-trigger';
 import type { FlashOrderOpts } from '../lib/flash-account';
 
-const m = vi.hoisted(() => ({ stop: vi.fn(), cancel: vi.fn(), place: vi.fn(), notify: vi.fn(), add: vi.fn(), modify: vi.fn(), remove: vi.fn(), bracket: vi.fn(),
+const m = vi.hoisted(() => ({ readClose: vi.fn(), watch: vi.fn(), readHeld: vi.fn(), restoreProt: vi.fn(), stop: vi.fn(), cancel: vi.fn(), place: vi.fn(), notify: vi.fn(), add: vi.fn(), modify: vi.fn(), remove: vi.fn(), bracket: vi.fn(),
     marks: new Map<string, { buy: LadderMark[]; sell: LadderMark[] }>(), background: false, protectedQty: 0 }));
 const accounts: Account[] = [{ account_type: 'F', broker_id: 'BR', account_id: 'F5678', signed: true, person_id: '', username: '' }];
 vi.mock('../lib/account-store', () => ({ ensureAccounts: () => undefined, useAccounts: () => ({ loaded: true, accounts, selectedStock: undefined, selectedFutures: accounts[0] }) }));
 vi.mock('../hooks/use-stream', () => ({ useQuote: () => undefined, useTradingLive: () => true }));
 vi.mock('../hooks/use-display-book', () => ({ useDisplayBook: () => ({ quote: { tick: { close: '100', volume: 1 } }, snapshot: { close: 100 }, book: undefined }) }));
 vi.mock('../hooks/use-flash-ladder', () => ({ useFlashLadder: () => ({ marks: m.marks, protectedQty: m.protectedQty, background: m.background }) }));
-vi.mock('../lib/flash-conditional', () => ({ flashAddTrigger: m.add, flashModifyTrigger: m.modify, flashRemoveTrigger: m.remove, flashPlaceBracket: m.bracket, flashStopProtections: m.stop }));
+vi.mock('../lib/flash-conditional', () => ({ flashAddTrigger: m.add, flashModifyTrigger: m.modify, flashRemoveTrigger: m.remove, flashPlaceBracket: m.bracket, flashStopProtections: m.stop,
+    flashReadHeld: m.readHeld, flashRestoreProtection: m.restoreProt, flashReadClose: m.readClose, flashLastPrice: async () => 100, flashEnvIs: async () => true }));
+vi.mock('../lib/flash-flatten-restore', async orig => ({ ...(await orig<typeof import('../lib/flash-flatten-restore')>()), restoreAfterUnfilledClose: m.watch }));
 vi.mock('../lib/shioaji', () => ({ cancelOrders: m.cancel }));
 vi.mock('../lib/trade', () => ({ notify: m.notify, placeQuickOrder: m.place, placeStockExitByShares: vi.fn() }));
 vi.mock('../lib/stream', () => ({ getAliasFor: () => undefined }));
@@ -70,7 +74,7 @@ beforeEach(() => {
     m.modify.mockResolvedValue(undefined);
     m.remove.mockResolvedValue(undefined);
     m.bracket.mockResolvedValue('placed');
-    m.stop.mockResolvedValue({ stopped: 0, blocked: [], failed: [] });
+    m.stop.mockResolvedValue({ stopped: 0, blocked: [], failed: [], restore: [] });
     m.cancel.mockResolvedValue([]);
     m.place.mockResolvedValue({ order: { id: 'o1' }, status: { status: 'Submitted' } });
 });
@@ -108,7 +112,7 @@ it('opposite and within the position: a protective stop that closes (Cover, no e
     expect(m.add.mock.calls[0]![0].role).toBeUndefined();
     await trig(r, 'sell', 100);
     expect(m.add).toHaveBeenCalledTimes(1);
-    expect(m.notify).toHaveBeenLastCalledWith(expect.objectContaining({ title: '⚡ 觸價單未建立', body: expect.stringContaining('立刻觸發') }));
+    expect(operationNotice(m.notify, '⚡ 觸價單未建立')).toMatchObject({ title: '⚡ 觸價單未建立', body: expect.stringContaining('立刻觸發') });
 });
 
 it('a limit send style goes out toward a fill (sell −N ticks)', async () => {
@@ -170,7 +174,7 @@ it('a pending trigger on the ladder: click deletes it, drag moves it, never acro
     await act(async () => { fire('pointermove', ev(12 * 22 + 5)); });
     await act(async () => { fire('pointerup', ev(12 * 22 + 5)); }); // 98
     expect(m.modify).toHaveBeenCalledTimes(1);
-    expect(m.notify).toHaveBeenLastCalledWith(expect.objectContaining({ body: expect.stringContaining('不能拖過') }));
+    expect(operationNotice(m.notify, '⚡ 觸價單未改價')).toMatchObject({ body: expect.stringContaining('不能拖過') });
     // Esc ends a drag without moving it
     await act(async () => { chip().props.onPointerDown(ev(5 * 22 + 5)); });
     await act(async () => { fire('pointermove', ev(1 * 22 + 5)); });
@@ -211,7 +215,7 @@ it('自動停損停利: a limit click goes through the panel bracket with the pa
     expect(req).toMatchObject({ action: 'Buy', entry: { type: 'LMT', price: 99 }, refPrice: 99,
         plan: { tiers: [{ quantity: 1, takeTicks: 16 }], stopTicks: 8 },
         order: { orderType: 'ROD', octype: 'Auto', futuresPriceType: 'MKT', confirmNote: '附自動停損停利（損 8・利 16 檔・背景執行）' } });
-    expect(m.notify).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'ok', title: expect.stringContaining('附停損停利') }));
+    expect(operationNotice(m.notify, '⚡ 買進已送出・附停損停利')).toMatchObject({ kind: 'ok', title: expect.stringContaining('附停損停利') });
     // the market button: a market entry priced from the traded price
     await act(async () => { await button(r, '市價賣')!.props.onClick(); });
     expect(m.bracket.mock.calls[1]![0]).toMatchObject({ action: 'Sell', entry: { type: 'MKT' }, refPrice: 100 });
@@ -223,14 +227,14 @@ it('自動停損停利: reducing is sent plainly, reversing is not sent, an unsu
     await click(r, 'sell', 101);
     expect(m.bracket).not.toHaveBeenCalled();
     expect(m.place).toHaveBeenCalledTimes(1);
-    expect(m.notify).toHaveBeenLastCalledWith(expect.objectContaining({ body: expect.stringContaining('減倉，未附加停損停利') }));
+    expect(operationNotice(m.notify, '⚡ 賣出已送出')).toMatchObject({ body: expect.stringContaining('減倉，未附加停損停利') });
     // qty 3 against a long 2: a reversal
     await act(async () => { r.root.findAll(n => n.type === 'input' && n.props['aria-label'] === '數量')[0]!.props.onChange({ target: { value: '3' } }); });
     if (button(r, '啟用閃電下單')) await arm(r);
     await click(r, 'sell', 101);
     expect(m.place).toHaveBeenCalledTimes(1);
     expect(m.bracket).not.toHaveBeenCalled();
-    expect(m.notify).toHaveBeenLastCalledWith(expect.objectContaining({ body: expect.stringContaining('反手') }));
+    expect(operationNotice(m.notify, '⚡ 閃電下單失敗')).toMatchObject({ body: expect.stringContaining('反手') });
 
     const cover = await mount({ order: { ...PROTECT, octype: 'Cover' } });
     expect(byTestId(cover, 'flash-protect')[0]!.props.title).toContain('新倉');
@@ -258,7 +262,7 @@ it('自動停損停利: a 新倉 order is protected even against a position; a r
     });
     await arm(view);
     await click(view, 'sell', 101);
-    expect(m.notify).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'err', body: expect.stringContaining('持倉已變動') }));
+    expect(operationNotice(m.notify, '⚡ 閃電下單失敗')).toMatchObject({ kind: 'err', body: expect.stringContaining('持倉已變動') });
 });
 
 it('a failed deletion is never announced as deleted', async () => {
@@ -271,7 +275,7 @@ it('a failed deletion is never announced as deleted', async () => {
     await act(async () => { byTestId(r, 'flash-trigger-mark')[0]!.props.onPointerDown(ev); });
     await act(async () => { fire('pointerup', ev); });
     await act(async () => { byTestId(r, 'flash-trigger-mark')[0]!.props.onClick({ stopPropagation() {} }); });
-    expect(m.notify).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'err', title: '⚡ 觸價單刪除未確認' }));
+    expect(operationNotice(m.notify, '⚡ 觸價單刪除未確認')).toMatchObject({ kind: 'err', title: '⚡ 觸價單刪除未確認' });
 });
 
 it('自動停損停利 + 觸價欄: a trigger entry that brackets its fill', async () => {
@@ -284,7 +288,7 @@ it('自動停損停利 + 觸價欄: a trigger entry that brackets its fill', asy
     expect(m.add).not.toHaveBeenCalled();
     expect(m.bracket.mock.calls[0]![0]).toMatchObject({ action: 'Buy', refPrice: 104,
         entry: { type: 'touch', price: 104, condition: 'above', send: { type: 'MKT' }, validity: { type: 'today' } } });
-    expect(m.notify).toHaveBeenLastCalledWith(expect.objectContaining({ title: expect.stringContaining('背景執行') }));
+    expect(operationNotice(m.notify, '⚡ 觸價單已掛・附停損停利（背景執行）')).toMatchObject({ title: expect.stringContaining('背景執行') });
 });
 
 it('the protect settings: applying saves them on the panel and locks the ladder', async () => {
@@ -312,30 +316,52 @@ it('the protect settings: applying saves them on the panel and locks the ladder'
 
 it('平倉 ends this panel\'s 停損停利 first, then closes; an exit out or unknown blocks the close', async () => {
     const order: string[] = [];
-    m.stop.mockImplementation(async (scope: unknown) => { order.push('stop'); expect(scope).toEqual({ account: { account_type: 'F', broker_id: 'BR', account_id: 'F5678' }, codes: ['TXFR1'], odd: false }); return { stopped: 2, blocked: [], failed: [] }; });
+    m.stop.mockImplementation(async (scope: unknown) => { order.push('stop'); expect(scope).toEqual({ account: { account_type: 'F', broker_id: 'BR', account_id: 'F5678' }, codes: ['TXFR1'], odd: false }); return { stopped: 2, blocked: [], failed: [],
+        restore: [{ exitAction: 'Sell', stop: 95, take: 110, quantity: 2 }] }; });
     m.place.mockImplementation(async () => { order.push('close'); return { order: { id: 'c' }, status: { status: 'Submitted' } }; });
     const r = await mount({ order: PROTECT, net: 2 });
     await arm(r);
     await act(async () => { await button(r, '平倉')!.props.onClick(); });
     expect(order).toEqual(['stop', 'close']);
     expect(m.place.mock.calls[0]![4]).toMatchObject({ ocType: 'Cover' });
-    expect(m.notify).toHaveBeenLastCalledWith(expect.objectContaining({ body: expect.stringContaining('已先取消停損停利 2 張') }));
+    // quantities in the product's unit (口), not a count of protections
+    expect(operationNotice(m.notify, '⚡ 平倉已送出')).toMatchObject({ body: expect.stringContaining('已先取消停損停利（2 口）') });
+    // the unfilled-close watch: what was held, what was protected, put back as Cover OCO triggers
+    const [before, snaps, code, unit, deps] = m.watch.mock.calls[0]!;
+    expect([before, snaps, code, unit]).toEqual([2, [{ exitAction: 'Sell', stop: 95, take: 110, quantity: 2 }], 'TXFR1', '口']);
+    m.readHeld.mockResolvedValue(1);
+    expect(await deps.readHeld()).toBe(1);
+    expect(m.readHeld).toHaveBeenCalledWith(accounts[0], ['TXFR1'], false);
+    m.restoreProt.mockResolvedValue(true);
+    await deps.restore({ exitAction: 'Sell', stop: 95, take: 110, quantity: 1 });
+    const [legs] = m.restoreProt.mock.calls[0]!;
+    expect(legs).toEqual([
+        expect.objectContaining({ action: 'Sell', condition: 'below', price: 95, kind: 'stop', octype: 'Cover', quantity: 1, ocoMode: 'trigger' }),
+        expect.objectContaining({ action: 'Sell', condition: 'above', price: 110, kind: 'take', octype: 'Cover', quantity: 1, ocoMode: 'trigger' }),
+    ]);
+    expect(legs[0].role).toBeUndefined();
+    expect(legs[0].group).toBe(legs[1].group);
+    // it waits for the close order itself (by its id) to be final
+    m.readClose.mockResolvedValue({ final: true, filled: 0 });
+    expect(await deps.readClose()).toEqual({ final: true, filled: 0 });
+    expect(m.readClose).toHaveBeenCalledWith(accounts[0], 'c');
 
-    m.stop.mockResolvedValue({ stopped: 0, blocked: ['TXFR1 停損停利的出場單結果未知'], failed: [] });
+    m.stop.mockResolvedValue({ stopped: 0, blocked: ['TXFR1 停損停利的出場單結果未知'], failed: [], restore: [] });
     await act(async () => { await button(r, '平倉')!.props.onClick(); });
     expect(m.place).toHaveBeenCalledTimes(1);
-    expect(m.notify).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'err', title: '⚡ 平倉未送出', body: expect.stringContaining('結果未知') }));
+    expect(operationNotice(m.notify, '⚡ 平倉未送出')).toMatchObject({ kind: 'err', title: '⚡ 平倉未送出', body: expect.stringContaining('結果未知') });
 
-    m.stop.mockResolvedValue({ stopped: 1, blocked: [], failed: ['主視窗沒有回應'] });
+    const beforeCancelFailure = m.notify.mock.calls.length;
+    m.stop.mockResolvedValue({ stopped: 1, blocked: [], failed: ['主視窗沒有回應'], restore: [] });
     await act(async () => { await button(r, '平倉')!.props.onClick(); });
     expect(m.place).toHaveBeenCalledTimes(1);
-    expect(m.notify).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'err', body: expect.stringContaining('取消未確認') }));
+    expect(operationNotice(m.notify, '⚡ 平倉未送出', beforeCancelFailure)).toMatchObject({ kind: 'err', body: expect.stringContaining('取消未確認') });
 });
 
 it('全刪 cancels the working orders and ends the 停損停利; enabled by protection alone', async () => {
     const trades = [{ account: accounts[0], contract: fut, order: { id: 'w1', account: accounts[0], price: 99, action: 'Buy', quantity: 1 },
         status: { status: 'Submitted', order_quantity: 1, deal_quantity: 0, cancel_quantity: 0, deals: [] } }];
-    m.stop.mockResolvedValue({ stopped: 1, blocked: [], failed: [] });
+    m.stop.mockResolvedValue({ stopped: 1, blocked: [], failed: [], restore: [] });
     let r!: ReactTestRenderer;
     await act(async () => { r = create(createElement(FlashOrder, { contract: fut, trades: trades as never, positions: [], orderOpts: PROTECT, onOrderOptsChange: vi.fn() }),
         { createNodeMock: () => ({ getBoundingClientRect: () => ({ top: 0 }), clientHeight: 462, addEventListener() {}, removeEventListener() {} }) }); });
@@ -345,7 +371,7 @@ it('全刪 cancels the working orders and ends the 停損停利; enabled by prot
     expect(m.cancel.mock.calls[0]![0]).toEqual(['w1']);
     expect(m.notify).toHaveBeenCalledWith(expect.objectContaining({ title: '⚡ 全刪・停損停利', body: expect.stringContaining('已取消停損停利 1 張') }));
     // blocked protection: the orders are still cancelled, the protection is reported
-    m.stop.mockResolvedValue({ stopped: 0, blocked: ['TXFR1 停損停利的出場單正在送出或等待成交'], failed: [] });
+    m.stop.mockResolvedValue({ stopped: 0, blocked: ['TXFR1 停損停利的出場單正在送出或等待成交'], failed: [], restore: [] });
     await act(async () => { await button(r, '全刪')!.props.onClick(); });
     expect(m.cancel).toHaveBeenCalledTimes(2);
     expect(m.notify).toHaveBeenCalledWith(expect.objectContaining({ kind: 'err', body: expect.stringContaining('停損停利未取消') }));
@@ -417,3 +443,48 @@ it('the preview uses the same entry / exit classification as placing (QA 10/13)'
     expect(m.bracket).not.toHaveBeenCalled();
 });
 
+
+it('a close refused right away (nothing went out) after the protection was ended: it is put back at once', async () => {
+    m.stop.mockResolvedValue({ stopped: 1, blocked: [], failed: [], restore: [{ exitAction: 'Sell', stop: 95, take: 110, quantity: 2 }], env: 'e' });
+    m.place.mockRejectedValue(Object.assign(new Error('券商拒絕'), { mutationNotStarted: true }));
+    const r = await mount({ order: PROTECT, net: 2 });
+    await arm(r);
+    await act(async () => { await button(r, '平倉')!.props.onClick(); });
+    expect(m.watch).toHaveBeenCalledTimes(1);
+    const deps = m.watch.mock.calls[0]![4];
+    expect(await deps.readClose()).toEqual({ final: true, filled: 0 });
+});
+
+it('an unknown close outcome: the protection is not put back, and the panel says it is unprotected', async () => {
+    m.stop.mockResolvedValue({ stopped: 1, blocked: [], failed: [], restore: [{ exitAction: 'Sell', stop: 95, take: 110, quantity: 2 }], env: 'e' });
+    m.place.mockRejectedValue(new Error('timeout'));
+    const r = await mount({ order: PROTECT, net: 2 });
+    await arm(r);
+    await act(async () => { await button(r, '平倉')!.props.onClick(); });
+    expect(m.watch).not.toHaveBeenCalled();
+    expect(m.notify).toHaveBeenCalledWith(expect.objectContaining({ title: '⚡ 停損停利已取消（未受保護）' }));
+});
+
+it('each restored protection gets its own OCO group; an alias panel shares the product lock', async () => {
+    m.stop.mockResolvedValue({ stopped: 2, blocked: [], failed: [], restore: [{ exitAction: 'Sell', stop: 95, take: 110, quantity: 1 }, { exitAction: 'Sell', stop: 95, take: 110, quantity: 1 }], env: 'e' });
+    m.place.mockResolvedValue({ order: { id: 'c' }, status: { status: 'Submitted' } });
+    const r = await mount({ order: PROTECT, net: 2 });
+    await arm(r);
+    await act(async () => { await button(r, '平倉')!.props.onClick(); });
+    const deps = m.watch.mock.calls[0]![4];
+    m.restoreProt.mockResolvedValue(true);
+    await deps.restore({ exitAction: 'Sell', stop: 95, take: 110, quantity: 1 });
+    await deps.restore({ exitAction: 'Sell', stop: 95, take: 110, quantity: 1 });
+    const g1 = m.restoreProt.mock.calls[0]![0][0].group;
+    const g2 = m.restoreProt.mock.calls[1]![0][0].group;
+    expect(g1).not.toBe(g2);
+});
+
+it('some protections ended before another failed: no close, and the ended ones are said to be unprotected', async () => {
+    m.stop.mockResolvedValue({ stopped: 1, blocked: [], failed: ['主視窗沒有回應'], restore: [], env: 'e' });
+    const r = await mount({ order: PROTECT, net: 2 });
+    await arm(r);
+    await act(async () => { await button(r, '平倉')!.props.onClick(); });
+    expect(m.place).not.toHaveBeenCalled();
+    expect(m.notify).toHaveBeenCalledWith(expect.objectContaining({ title: '⚡ 部分停損停利已取消（未受保護）' }));
+});

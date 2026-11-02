@@ -1,7 +1,7 @@
 // src/App.tsx — Shioaji Pro trading terminal
 // Dynamic panel blocks on a draggable grid, with named layout profiles.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import GridLayout, {
     useContainerWidth,
     type Layout,
@@ -12,7 +12,10 @@ import * as styles from './App.css';
 import { BottomDock } from './components/bottom-dock';
 import { AsyncStatus, type AsyncPhase } from './components/async-status';
 import { CandleChart } from './components/candle-chart';
+import { ChainMap } from './components/chain-map';
+import { PortfolioSectorPanel } from './components/portfolio-sector-panel';
 import { ChipsCard } from './components/chips-card';
+import { CompanyPanel } from './components/company-panel';
 import { ComboListPanel } from './components/combo-list';
 import { ComboTicket } from './components/combo-ticket';
 import { CommandPalette } from './components/command-palette';
@@ -64,6 +67,7 @@ import { useWatchlist } from './hooks/use-watchlist';
 import { markWorkspaceVisible } from './lib/frontend-ready';
 import { trackActivity } from './lib/activity';
 import { registerAgentAppCommandHost } from './lib/agent-app-command';
+import { WorkspaceUndoHistory } from './lib/workspace-history';
 import { requestedBacktestPanelId, selectBacktestPanelId } from './lib/backtest-link-routing';
 import {
     isAgentHarnessEnabled,
@@ -160,9 +164,11 @@ const POPOUT_TYPES: ReadonlySet<string> = new Set([
     'flash',
     'oddspread',
     'chips',
+    'company',
     'volprofile',
     'optchain',
     'pnl',
+    'holdingmap',
     'replay',
     'depthmap',
 ]);
@@ -174,6 +180,7 @@ const POPOUT_CODE = popoutQuery.get('code') || null;
 const popoutSession = popoutSessionFromQuery(popoutQuery);
 const popoutChartSession = popoutSession.chartSession;
 const popoutIntradaySession = popoutSession.intradaySession;
+const popoutChartInterval = popoutSession.chartInterval;
 
 // resolves a block's contract: pinned code (contract cache) or global selection
 // sourceCode: the pinned code or the link group's code (null = follow selection)
@@ -283,7 +290,13 @@ function BlockBody({
         case 'chart':
             return contract ? (
                 <>
-                    <QuoteBoard contract={contract} snapshot={snapshot} />
+                    <QuoteBoard
+                        contract={contract}
+                        snapshot={snapshot}
+                        sessionMode={block.chartSession}
+                        fields={block.quoteBoard}
+                        onFieldsChange={(quoteBoard) => onSessionConfigChange(block.id, { quoteBoard })}
+                    />
                     <CandleChart
                         panelId={block.id}
                         contract={contract}
@@ -292,6 +305,10 @@ function BlockBody({
                         sessionMode={block.chartSession}
                         onSessionModeChange={(chartSession) =>
                             onSessionConfigChange(block.id, { chartSession })
+                        }
+                        interval={block.chartInterval}
+                        onIntervalChange={(chartInterval) =>
+                            onSessionConfigChange(block.id, { chartInterval })
                         }
                         orderSettings={block.chartOrder}
                         onOrderSettingsChange={(chartOrder) =>
@@ -408,6 +425,16 @@ function BlockBody({
             ) : (
                 <BlockPlaceholder phase={missingContractPhase} />
             );
+        case 'company':
+            return contract ? (
+                <CompanyPanel
+                    contract={contract}
+                    snapshot={snapshot?.code === contract.code ? snapshot : undefined}
+                    onPick={onSelectCode}
+                />
+            ) : (
+                <BlockPlaceholder phase={missingContractPhase} />
+            );
         case 'volprofile':
             return contract ? (
                 <VolProfile contract={contract} />
@@ -468,6 +495,27 @@ function BlockBody({
             return <ConditionalPanel contract={contract} />;
         case 'heatmap':
             return <SectorHeatmap onPick={onSelectCode} />;
+        case 'chainmap':
+            return (
+                <ChainMap
+                    contract={contract}
+                    onPick={onSelectCode}
+                    view={block.chainView}
+                    kind={block.chainKind}
+                    onViewChange={(chainView) => onSessionConfigChange(block.id, { chainView })}
+                    onKindChange={(chainKind) => onSessionConfigChange(block.id, { chainKind })}
+                />
+            );
+        case 'holdingmap':
+            return (
+                <PortfolioSectorPanel
+                    onPick={onSelectCode}
+                    form={block.holdingForm}
+                    grouping={block.holdingGrouping}
+                    onFormChange={(holdingForm) => onSessionConfigChange(block.id, { holdingForm })}
+                    onGroupingChange={(holdingGrouping) => onSessionConfigChange(block.id, { holdingGrouping })}
+                />
+            );
         case 'pulse':
             return (
                 <MarketPulsePanel
@@ -719,6 +767,10 @@ function PopoutView({
     // 信用條件也依視窗 id 存（開啟端預先寫入面板的條件），重新整理後保留
     const [flashCredit, setFlashCredit] = useState(() => loadPopoutFlashCredit(POPOUT_WINDOW_ID));
     const [flashOrder, setFlashOrder] = useState(() => loadPopoutFlashOrder(POPOUT_WINDOW_ID));
+    // K 線的全盤／僅日盤放在這裡，報價欄的開高低才能跟著切（只在這個視窗內，不寫回面板）
+    const [chartSession, setChartSession] = useState(popoutChartSession);
+    const [holdingForm, setHoldingForm] = useState(popoutSession.holdingForm);
+    const [holdingGrouping, setHoldingGrouping] = useState(popoutSession.holdingGrouping);
     // heartbeat: a long-open popout must not be evicted as "stale"
     useEffect(() => {
         if (type !== 'flash' || !POPOUT_WINDOW_ID) return;
@@ -729,6 +781,17 @@ function PopoutView({
 
     let body: React.ReactNode = <BlockPlaceholder />;
     if (type === 'pnl') body = <PnlPanel />;
+    else if (type === 'holdingmap')
+        // popout 點持股 → 切換主視窗的選取商品；呈現／分組從面板帶入，之後只在這個視窗內切換
+        body = (
+            <PortfolioSectorPanel
+                onPick={broadcastSelectCode}
+                form={holdingForm}
+                grouping={holdingGrouping}
+                onFormChange={setHoldingForm}
+                onGroupingChange={setHoldingGrouping}
+            />
+        );
     else if (type === 'optchain')
         // popout T 字 click → switch the MAIN window's selected symbol so
         // 下單面板等連動面板跟著動（issue #1: T 字要同時連動下單面板）
@@ -757,12 +820,14 @@ function PopoutView({
             case 'chart':
                 body = (
                     <>
-                        <QuoteBoard contract={contract} />
+                        <QuoteBoard contract={contract} sessionMode={chartSession} fields={popoutSession.quoteBoard} />
                         <CandleChart
                             contract={contract}
                             trades={tradesState.data ?? []}
                             onOrdersChanged={tradesState.refresh}
-                            sessionMode={popoutChartSession}
+                            sessionMode={chartSession}
+                            onSessionModeChange={setChartSession}
+                            interval={popoutChartInterval}
                         />
                     </>
                 );
@@ -845,6 +910,9 @@ function PopoutView({
             case 'chips':
                 body = <ChipsCard contract={contract} />;
                 break;
+            case 'company':
+                body = <CompanyPanel contract={contract} />;
+                break;
             case 'volprofile':
                 body = <VolProfile contract={contract} />;
                 break;
@@ -903,6 +971,9 @@ function MainApp() {
         createList,
         renameCurrentList,
         deleteCurrentList,
+        reloadFromServer,
+        reloading: watchlistReloading,
+        holdReload,
     } = useWatchlist();
     const [selected, setSelected] = useState<ContractInfo | null>(null);
     const [agentHarnessEnabled, setAgentHarnessEnabledState] = useState(
@@ -1123,6 +1194,8 @@ function MainApp() {
     // 欄寬與最小寬不再跟著螢幕等比放大，超寬幕上面板可以縮得更窄、
     // 拖拉步進更細。k 皆整除 12 → 同密度回存無損；跨密度僅一次舍入。
     const density = width < 1800 ? 1 : width < 2800 ? 2 : width < 3900 ? 3 : 4;
+    const densityRef = useRef(density);
+    densityRef.current = density;
     const renderCols = GRID_LEGACY_COLS * density;
     const colW = width > 0 ? width / renderCols : 53;
     const renderLayout = useMemo(() => {
@@ -1442,6 +1515,27 @@ function MainApp() {
         replaceWorkspace(structuredClone(DEFAULT_WORKSPACE));
     }, [replaceWorkspace]);
 
+    // Agent 套用版面規格（#331）的復原步驟：只在記憶體，一次套用＝一步。
+    // 頁首「復原版面」與 Agent 的 undo_workspace_change 共用同一份紀錄與
+    // 同一條防呆（面板組成被改過就不能復原）
+    const workspaceHistory = useMemo(() => new WorkspaceUndoHistory(), []);
+    useSyncExternalStore(workspaceHistory.subscribe, workspaceHistory.getVersion);
+    useEffect(() => {
+        workspaceHistory.settle(workspace);
+    }, [workspaceHistory, workspace]);
+    const workspaceUndo = workspaceHistory.peek(workspace);
+    const undoWorkspaceChange = useCallback(() => {
+        const result = workspaceHistory.pop(workspaceRef.current);
+        if (!result.ok) return;
+        replaceWorkspace(structuredClone(result.entry.before));
+        trackActivity('復原版面', result.entry.label);
+        notify({
+            kind: 'info',
+            title: '版面已復原',
+            body: `已還原「${result.entry.label}」之前的版面`,
+        });
+    }, [workspaceHistory, replaceWorkspace]);
+
     const loadPreset = useCallback(
         (name: string) => {
             const preset = LAYOUT_PRESETS.find((p) => p.name === name);
@@ -1526,8 +1620,29 @@ function MainApp() {
                 },
                 updateWorkspace: replaceWorkspace,
                 createPanelId: newBlockId,
+                workspaceHistory,
+                getGridDensity: () => densityRef.current,
+                getViewportRows: () => {
+                    // rowHeight 30 + margin 6, containerPadding 6
+                    const height = containerRef.current?.clientHeight ?? 0;
+                    return height > 0 ? Math.max(1, Math.floor((height - 6) / 36)) : null;
+                },
+                onWorkspaceSpecChange: ({ kind, entry }) => {
+                    trackActivity(
+                        kind === 'applied' ? 'Agent 套版面' : '復原版面',
+                        entry.label,
+                    );
+                    notify({
+                        kind: 'info',
+                        title: kind === 'applied' ? 'Agent 已調整版面' : '版面已復原',
+                        body:
+                            kind === 'applied'
+                                ? `「${entry.label}」— 可按頁首「復原版面」還原`
+                                : `已還原「${entry.label}」之前的版面`,
+                    });
+                },
         }, { readOnly: !agentHarnessEnabled });
-    }, [agentHarnessEnabled, replaceWorkspace]);
+    }, [agentHarnessEnabled, replaceWorkspace, workspaceHistory, containerRef]);
 
     const deleteProfile = useCallback(
         (name: string) => {
@@ -1597,6 +1712,9 @@ function MainApp() {
         structureBusy,
         loadError,
         onRetryLoad: retryLoad,
+        onReload: () => reloadFromServer({ source: 'user' }),
+        reloading: watchlistReloading,
+        onHoldReload: holdReload,
     };
     const dockProps = {
         positions: positionsState.data ?? [],
@@ -1621,6 +1739,8 @@ function MainApp() {
                 onRenameProfile={renameProfile}
                 onResetWorkspace={resetWorkspace}
                 onLoadPreset={loadPreset}
+                workspaceUndo={workspaceUndo}
+                onUndoWorkspace={undoWorkspaceChange}
                 flashCodes={items
                     .filter((i) => i.contract.security_type !== 'IND')
                     .map((i) => i.contract.code)}

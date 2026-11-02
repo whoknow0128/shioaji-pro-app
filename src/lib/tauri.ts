@@ -7,6 +7,8 @@ import {
     DEFAULT_PORT,
     EXPECTED_SERVER_VERSION,
     LEGACY_PORT,
+    blockForeignServerPort,
+    foreignServerPortBlocked,
     getApiBase,
     getDevServerPort,
     getApiPort,
@@ -21,21 +23,24 @@ import {
 } from './runtime';
 import {
     getStoredSpawnKeyHash,
-    hashCredentials,
     setStoredSpawnKeyHash,
     shouldForceRespawn,
 } from './spawn-keys';
-import {
-    cacheAgentHarnessEnabled,
-    resolveAgentHarnessSetting,
-} from './agent-harness-state';
 import {
     harnessOwnershipCompatible,
     recoverHarnessOwnership,
 } from './sidecar-ownership';
 import { notify } from './trade';
+import {
+    type ForeignVerdict,
+    foreignServerVerdict,
+    hashPerson,
+    knownPersonHash,
+    recordOwnIdentity,
+} from './server-adoption';
 import { FAST_START_SCHEDULE, STOP_SCHEDULE, pollDelay, pollUntil, throttled } from './poll-until';
 import { serverHealthReady } from './server-health';
+import { BINARY_PROBLEM_TEXT, classifyServerStart, type BinaryProblem, type ServerStartError, type StartFailureStage } from './server-start-error';
 import { serverIdentityVerified, setServerIdentityVerified } from './server-identity';
 import {
     boundPorts,
@@ -69,7 +74,9 @@ import {
     peekActiveTiming,
     subscribeTiming,
 } from './startup-timing';
-import { cacheDesktopConfigured } from './desktop-setup-state';
+import { loadDesktopSettings, saveDesktopSettings, importCredentialEnv, type DesktopSettings, type CredentialEnvironment } from './desktop-credentials';
+export { loadDesktopSettings, saveDesktopSettings, saveCredentialProfile, selectCredentialProfile, deleteCredentialProfile, logoutCredentialProfile, EMPTY_DESKTOP_SETTINGS } from './desktop-credentials';
+export type { DesktopSettings, CredentialProfile, CredentialDraft } from './desktop-credentials';
 import { isChildWindow } from './window-role';
 import { newPopoutWindowId } from './flash-account';
 
@@ -185,21 +192,6 @@ export interface SidecarResult {
 // eslint-disable-next-line no-control-regex
 const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
 
-async function sidecar(
-    args: string[],
-    env?: Record<string, string>,
-): Promise<SidecarResult> {
-    const { Command } = await import('@tauri-apps/plugin-shell');
-    const cmd = Command.sidecar('binaries/shioaji', args, {
-        env: { NO_COLOR: '1', ...env },
-    });
-    const out = await cmd.execute();
-    const text = `${out.stdout}\n${out.stderr}`
-        .replace(ANSI_RE, '')
-        .trim();
-    return { ok: out.code === 0, output: text };
-}
-
 // `shioaji server start` runs the server in the FOREGROUND — it never exits,
 // so awaiting execute() hangs the UI on 啟動中 forever. Spawn it instead and
 // poll health to know when it's actually up; surface the captured log only if
@@ -217,25 +209,27 @@ async function spawnServer(
     port: number,
     scheme: ApiScheme = 'http',
     agentHarnessEnabled = true,
-): Promise<SidecarResult> {
+    credentialRevision: string | null = null,
+): Promise<SidecarResult & { stage?: StartFailureStage }> {
     const fullEnv = { NO_COLOR: '1', ...env };
     const { invoke } = await import('@tauri-apps/api/core');
     markStage('spawn', `port=${port} ${args.includes('--production') ? 'prod' : 'sim'}`);
     let pid: number;
     try {
         setTrayStatus('boot');
-        pid = await invoke<number>('spawn_server', {
+        const receipt = await invoke<{ pid: number; credentialRevision: string }>('spawn_server', {
             args,
             env: fullEnv,
             port,
             agentHarnessEnabled,
+            credentialRevision,
         });
+        pid = receipt.pid;
+        setStoredSpawnKeyHash(receipt.credentialRevision);
     } catch (e) {
-        if (/not found|unknown/i.test(String(e))) {
-            // older Rust shell without the command — channel streaming
-            return spawnServerViaChannels(args, env, port, scheme);
-        }
-        return { ok: false, output: `啟動失敗：${String(e)}` };
+        // the native refusal names its cause (an unusable bundled sidecar
+        // also writes it to this port's log); keep it verbatim to classify
+        return { ok: false, output: `啟動失敗：${String(e)}`, stage: 'spawn' };
     }
     setServerPid(pid);
     setSpawnPort(port);
@@ -270,11 +264,12 @@ async function spawnServer(
     }
     if (waited.value === 'died') {
         setServerPid(null);
-        return { ok: false, output: await readServerLog(port) };
+        return { ok: false, output: await readServerLog(port), stage: 'died' };
     }
     return {
         ok: false,
         output: `${await readServerLog(port)}\n啟動逾時（45 秒未就緒）`.trim(),
+        stage: 'timeout',
     };
 }
 
@@ -330,6 +325,8 @@ function reloadIfConfiguredServerHealthy(): void {
                     : scheme !== 'http') return false;
                 if (!harnessOwnershipCompatible(settings.agentHarnessEnabled,
                     !!candidate.port && await nativeOwnsHarnessSidecar(candidate.port))) return false;
+                // another program's server: the same environment and account only (#285)
+                if (await foreignServerCheck(candidate, settings)) return false;
                 return !settings.production || !settings.caPath ||
                     (!!candidate.port && await caActive(candidate.port, scheme));
             });
@@ -375,82 +372,28 @@ export function ensureHarnessOwnedServer(opts: { deferReload?: boolean } = {}): 
     });
 }
 
-// startup/login output lands in ~/.shioaji/sjpro-server-<port>.log now —
+// Pro's native shell captures stdout/stderr in ~/.shioaji/sjpro-server-<port>.log.
+// SDK 1.7.9 also writes daily logs, while keeping its terminal output —
 // read it back for error surfacing and the CA-activation warning scan
+export async function serverLogPath(port: number): Promise<string> {
+    const { homeDir, join } = await import('@tauri-apps/api/path');
+    return join(await homeDir(), '.shioaji', `sjpro-server-${port}.log`);
+}
+
+/** Open the folder of the sidecar start logs (fixed natively: ~/.shioaji). */
+export async function openServerLogFolder(): Promise<void> {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke<string>('open_server_log_folder');
+}
+
 async function readServerLog(port: number): Promise<string> {
     try {
         const { readTextFile } = await import('@tauri-apps/plugin-fs');
-        const { homeDir, join } = await import('@tauri-apps/api/path');
-        const p = await join(
-            await homeDir(),
-            '.shioaji',
-            `sjpro-server-${port}.log`,
-        );
-        const text = await readTextFile(p);
+        const text = await readTextFile(await serverLogPath(port));
         return text.replace(ANSI_RE, '').trim().slice(-4000);
     } catch {
         return '';
     }
-}
-
-async function spawnServerViaChannels(
-    args: string[],
-    env: Record<string, string>,
-    port: number,
-    scheme: ApiScheme = 'http',
-): Promise<SidecarResult> {
-    const { Command } = await import('@tauri-apps/plugin-shell');
-    const cmd = Command.sidecar('binaries/shioaji', args, {
-        env: { NO_COLOR: '1', ...env },
-    });
-    let buf = '';
-    let exitCode: number | null = null;
-    cmd.stdout.on('data', (l) => (buf += l));
-    cmd.stderr.on('data', (l) => (buf += l));
-    cmd.on('close', (e: { code: number | null }) => {
-        exitCode = e.code ?? -1;
-    });
-    cmd.on('error', (e) => {
-        buf += `\n${String(e)}`;
-        exitCode = -1;
-    });
-    let child: { pid?: number } | null = null;
-    try {
-        child = await cmd.spawn();
-    } catch (e) {
-        return { ok: false, output: `啟動失敗：${String(e)}` };
-    }
-    // Remember the child pid for legacy stop/restart behavior. This fallback
-    // intentionally cannot register a trusted harness sidecar: renderer-owned
-    // PID/port input must never establish the native signing boundary.
-    if (child?.pid) {
-        setServerPid(child.pid);
-        setSpawnPort(port);
-    }
-    // poll until the server answers, or it dies, or we give up (~45s covers a
-    // production login + CA activation + contract load)
-    markStage('wait-listener', 'legacy spawn');
-    const waited = await pollUntil<'up' | 'died'>(
-        async () => {
-            if (await probeInfo(port, scheme)) return 'up';
-            // process exited before serving — a real start failure
-            return exitCode !== null && exitCode !== 0 ? 'died' : undefined;
-        },
-        { timeoutMs: 45_000 },
-    );
-    if (waited.value === 'up') {
-        markStage('listener-up', `polls=${waited.attempts}`);
-        return { ok: true, output: buf.replace(ANSI_RE, '').trim() };
-    }
-    if (waited.value === 'died') {
-        setServerPid(null);
-        return { ok: false, output: buf.replace(ANSI_RE, '').trim() };
-    }
-    return {
-        ok: false,
-        output:
-            `${buf.replace(ANSI_RE, '').trim()}\n啟動逾時（45 秒未就緒）`.trim(),
-    };
 }
 
 // Ports a shioaji server could be answering on: whatever the app last used,
@@ -518,8 +461,21 @@ async function runMkcert(args: string[]): Promise<SidecarResult> {
         const text = `${out.stdout}\n${out.stderr}`.replace(ANSI_RE, '').trim();
         return { ok: out.code === 0, output: text };
     } catch (e) {
-        // dev builds without scripts/fetch-mkcert.sh, or a broken bundle
-        return { ok: false, output: `MKCERT_SIDECAR_MISSING: ${String(e)}` };
+        // dev builds without scripts/fetch-mkcert.sh, or a broken bundle —
+        // name the path and why (missing, 0 bytes, not executable)
+        return { ok: false, output: `MKCERT_SIDECAR_MISSING: ${(await mkcertProblem()) ?? String(e)}` };
+    }
+}
+
+type BundledBinaryStatus = { binary: string; path: string | null; problem: BinaryProblem | null };
+async function mkcertProblem(): Promise<string | null> {
+    try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const all = await invoke<BundledBinaryStatus[]>('bundled_binaries_status');
+        const mk = all.find((b) => b.binary === 'mkcert');
+        return mk?.problem ? `${mk.path ?? 'mkcert'}（${BINARY_PROBLEM_TEXT[mk.problem]}）` : null;
+    } catch {
+        return null; // older native shell without the command
     }
 }
 
@@ -624,27 +580,22 @@ export async function serverStatus(
     }
     if (getDevServerPort()) return { running: false };
     try {
-        const res = await sidecar(['server', 'status', '--format', 'json']);
-        const jsonStart = res.output.indexOf('{');
-        if (jsonStart >= 0) {
-            const st = JSON.parse(
-                res.output.slice(jsonStart),
-            ) as ServerStatus;
-            if (st.running && st.port && !ports.includes(st.port)) {
-                const hit = await probeInfoEither(st.port);
-                if (hit) {
-                    const status: ServerStatus = {
-                        running: true,
-                        port: st.port,
-                        healthy: await probeHealthy(st.port, hit.scheme),
-                        simulation: hit.info.simulation,
-                        version: hit.info.version,
-                        scheme: hit.scheme,
-                        agentHarnessEnabled: hit.info.agentHarnessEnabled,
-                        pid: st.pid,
-                    };
-                    if (!accept || await accept(status)) return status;
-                }
+        const { invoke } = await import('@tauri-apps/api/core');
+        const st = await invoke<ServerStatus>('sidecar_server_status');
+        if (st.running && st.port && !ports.includes(st.port)) {
+            const hit = await probeInfoEither(st.port);
+            if (hit) {
+                const status: ServerStatus = {
+                    running: true,
+                    port: st.port,
+                    healthy: await probeHealthy(st.port, hit.scheme),
+                    simulation: hit.info.simulation,
+                    version: hit.info.version,
+                    scheme: hit.scheme,
+                    agentHarnessEnabled: hit.info.agentHarnessEnabled,
+                    pid: st.pid,
+                };
+                if (!accept || await accept(status)) return status;
             }
         }
     } catch {
@@ -809,6 +760,76 @@ export async function caActive(
     }
 }
 
+// The person a server is logged into, hashed (#285) — null when it cannot
+// be read (still logging in, no accounts, not answering).
+export async function serverPersonHash(
+    port: number,
+    scheme: ApiScheme = getApiScheme(),
+): Promise<string | null> {
+    try {
+        const res = await probeFetch(`${scheme}://127.0.0.1:${port}/api/v1/auth/accounts`, 2000);
+        if (!res.ok) return null;
+        const accts = (await res.json()) as { person_id?: unknown }[];
+        const pid = Array.isArray(accts) ? accts[0]?.person_id : undefined;
+        return typeof pid === 'string' ? await hashPerson(pid) : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Is this server one this App started? Its spawn record must name the port
+ * AND the spawned process must still be alive (or the native shell owns it
+ * in this App process) — a record left behind by a sidecar that exited
+ * proves nothing about whoever listens on that port now (#285). The isolated
+ * dev port (VITE_DEV_SERVER_PORT, dev builds only) counts as this App's: the
+ * developer chose exactly that server for this dev App.
+ */
+export async function ownsServer(status: ServerStatus | null | undefined): Promise<boolean> {
+    if (!status?.port) return false;
+    if (getDevServerPort() === status.port) return true;
+    if (getSpawnPort() !== status.port) return false;
+    if (await nativeOwnsHarnessSidecar(status.port)) return true;
+    const pid = getServerPid();
+    if (!pid) return false;
+    try {
+        const { invoke } = await core();
+        return await invoke<boolean>('process_alive', { pid });
+    } catch {
+        return false; // unknown is not ours
+    }
+}
+
+/**
+ * #285: a server this App did not start is adopted only in the configured
+ * environment and on the account this App's own server logged into before.
+ * `null` = adoptable (or it is this App's own server).
+ */
+export async function foreignServerCheck(
+    status: ServerStatus,
+    settings: Pick<DesktopSettings, 'credentialRevision' | 'production'>,
+): Promise<ForeignVerdict | null> {
+    if (!status.running || !status.port || await ownsServer(status)) return null;
+    const keyHash = settings.credentialRevision;
+    const known = knownPersonHash(keyHash);
+    // the account is only read when the environment already matches
+    const modeOk = status.simulation !== undefined && status.simulation !== settings.production;
+    const personHash = modeOk && known ? await serverPersonHash(status.port, status.scheme ?? 'http') : null;
+    return foreignServerVerdict(
+        { port: status.port, simulation: status.simulation, personHash },
+        { production: settings.production, knownPersonHash: known },
+    );
+}
+
+/** Remember the account this App's OWN server is logged into, under the
+ * keys it was started with — what a foreign server is compared against. */
+export async function learnOwnIdentity(status: ServerStatus): Promise<void> {
+    if (!status.port || !(await ownsServer(status))) return;
+    const keyHash = getStoredSpawnKeyHash();
+    if (!keyHash) return;
+    recordOwnIdentity(keyHash, await serverPersonHash(status.port, status.scheme ?? 'http'));
+}
+
 // AbortSignal.timeout() cannot be cancelled after a request settles. With the
 // Tauri HTTP plugin, its later abort event attempts to close an already-freed
 // Rust resource and surfaces as an unhandled "resource id ... is invalid"
@@ -830,20 +851,47 @@ export interface StartResult extends SidecarResult {
     port: number;
     attached: boolean; // an existing shioaji server was reused
     portChanged: boolean; // the app's API base moved — caller should reload
+    /** the reused server was started by another program (checked, #285) */
+    attachedExternal?: boolean;
+    /** another program's server was found and NOT used (#285) */
+    foreign?: { port: number; simulation: boolean | undefined; text: string };
+    /** how a failed start ended (set only when ok is false) */
+    stage?: StartFailureStage;
+    /** why a failed start failed, for a specific message (ok false only) */
+    error?: ServerStartError;
+    /** the sidecar start log of a failed spawn */
+    logPath?: string;
+    /** a failed start's own output, without the explanatory notes appended
+     * to `output` (an HTTP-fallback TLS note must not read as the cause) */
+    failureOutput?: string;
 }
 
-export async function serverStart(opts: {
+type StartOptions = {
     // boot already probed the servers a moment ago: reuse that result
     // instead of a second identical round of probes (cold start)
     knownStatus?: ServerStatus | null;
-    apiKey: string;
-    secretKey: string;
+    credentialRevision: string | null;
     production: boolean;
     caPath?: string;
-    caPasswd?: string;
     httpsEnabled?: boolean;
     agentHarnessEnabled?: boolean;
-}): Promise<StartResult> {
+};
+
+export async function serverStart(opts: StartOptions): Promise<StartResult> {
+    const res = await startServerOnce(opts);
+    if (res.ok) return res;
+    const spawned = res.stage !== undefined && res.stage !== 'precheck';
+    return {
+        ...res,
+        error: classifyServerStart({ output: res.failureOutput ?? res.output, stage: res.stage, port: res.port }),
+        ...(spawned ? { logPath: await serverLogPath(res.port).catch(() => undefined) } : {}),
+    };
+}
+
+async function startServerOnce(opts: StartOptions): Promise<StartResult> {
+    if (!opts.credentialRevision) {
+        return { ok: false, output: '請先完成帳號設定並選擇使用中的帳號', port: getApiPort(), attached: false, portChanged: false, stage: 'precheck' };
+    }
     // when production+CA is requested, a daemon is only good enough to reuse
     // if its CA is actually active — otherwise orders 400 (issue #1)
     const needsCa = !!opts.production && !!opts.caPath;
@@ -932,6 +980,9 @@ export async function serverStart(opts: {
             };
         }
     }
+    // another program's server that is not used (#285): never stopped,
+    // never reclaimed — this App starts its own on a free port instead
+    let foreign: StartResult['foreign'];
     if (st?.running && st.port) {
         const stScheme: ApiScheme = st.scheme ?? 'http';
         const modeMismatch =
@@ -971,14 +1022,15 @@ export async function serverStart(opts: {
         // compatible so adoption proceeds exactly as before — never a new
         // restart loop. A forced respawn lands the new hash below, so the
         // check converges after a single restart.
-        const currentKeyHash = await hashCredentials(
-            opts.apiKey,
-            opts.secretKey,
-        );
+        const currentKeyHash = opts.credentialRevision;
         const keyMismatch =
             !external &&
             shouldForceRespawn(getStoredSpawnKeyHash(), currentKeyHash);
         const caOk = !needsCa || (await caActive(st.port, stScheme));
+        // not started by this App: the environment and the account must
+        // match before it is used at all (#285)
+        const ownRecord = await ownsServer(st);
+        const foreignVerdict = ownRecord ? null : await foreignServerCheck(st, opts);
         if (
             st.healthy &&
             !modeMismatch &&
@@ -986,22 +1038,38 @@ export async function serverStart(opts: {
             caOk &&
             !versionMismatch &&
             !harnessMismatch &&
-            !keyMismatch
+            !keyMismatch &&
+            !foreignVerdict
         ) {
             // healthy, right mode, right version, CA live — just use it
             markStage('attach', `port=${st.port}`);
+            if (foreignServerPortBlocked() === st.port) blockForeignServerPort(null);
             const schemeChanged = setApiScheme(stScheme);
             return {
                 ok: true,
-                output: `伺服器已在運行（port ${st.port}）`,
+                output: ownRecord
+                    ? `伺服器已在運行（port ${st.port}）`
+                    : `已連上另一個程式啟動的${st.simulation ? '模擬' : '正式'}伺服器（port ${st.port}）`,
                 port: st.port,
                 attached: true,
+                attachedExternal: !ownRecord,
                 portChanged: setApiPort(st.port) || schemeChanged,
             };
         }
-        if (versionMismatch && external) {
-            // 使用者自己的 server 版本不符（例如 8080 上的舊 CLI）——
-            // 絕不動它，直接往下走：在別的 port 起自帶 binary
+        if (!ownRecord || (versionMismatch && external)) {
+            // 不是本 App 啟動的 server（另一個 App 的正式伺服器、使用者的
+            // CLI、版本不符的舊 server…）——絕不停止它，也不接上；往下走，
+            // 在別的 port 起本 App 自己的 server（#285）
+            const why = foreignVerdict?.text ?? `:${st.port} 上另一個程式啟動的伺服器（${
+                schemeMismatch ? `連線協定不符（server ${stScheme}，需 ${wantScheme}）`
+                    : versionMismatch ? `版本不符（server ${st.version}，需 ${EXPECTED_SERVER_VERSION}）`
+                    : !caOk ? 'CA 未啟用，正式環境無法下單'
+                    : harnessMismatch ? '已開啟 Agent Harness，本 App 只使用自己啟動的伺服器'
+                    : '狀態不健康'}），未連上，也不會停止它`;
+            if (!ownRecord) {
+                foreign = { port: st.port, simulation: st.simulation, text: why };
+                markStage('attach', `foreign server not used, port=${st.port}`);
+            }
         } else {
             // unhealthy, wrong mode/version, or CA not active — stop it and
             // start fresh with the requested settings instead of attaching
@@ -1035,6 +1103,7 @@ export async function serverStart(opts: {
                     port: st.port,
                     attached: false,
                     portChanged: false,
+                    stage: 'precheck',
                 };
             }
         }
@@ -1051,9 +1120,17 @@ export async function serverStart(opts: {
         // reclaim our own before picking a port; foreign listeners refuse
         // the ownership check and find_free_port dodges them below
         for (const p of new Set(getDevServerPort() ? [preferredPort] : [getApiPort(), DEFAULT_PORT])) {
+            if (foreign && p === foreign.port) continue; // another program's server
+            // only a port this App spawned on is ever reclaimed: another
+            // App's sidecar that is merely slow to answer is not a zombie
+            // of ours (#285) — find_free_port below dodges it instead
+            if (!getDevServerPort() && getSpawnPort() !== p) continue;
+            // a server that answers is never a zombie: it is someone's (#285)
+            if (await probeInfoEither(p)) continue;
             await invoke('kill_shioaji', {
                 port: p,
-                pid: getServerPid(),
+                // our remembered pid only for the port it was spawned on
+                pid: getSpawnPort() === p ? getServerPid() : null,
             }).catch(() => undefined);
         }
         setServerPid(null);
@@ -1071,7 +1148,7 @@ export async function serverStart(opts: {
             markStage('reclaim-port', `port freed after ${picked.elapsedMs} ms`);
         }
         if (getDevServerPort() && free !== preferredPort) {
-            return { ok: false, output: '隔離測試連接埠已被占用；不切換至其他伺服器', port: preferredPort, attached: false, portChanged: false };
+            return { ok: false, output: '隔離測試連接埠已被占用；不切換至其他伺服器', port: preferredPort, attached: false, portChanged: false, stage: 'precheck', ...(foreign ? { foreign } : {}) };
         }
         if (free > 0) port = free;
     } catch {
@@ -1080,8 +1157,6 @@ export async function serverStart(opts: {
     }
 
     const env: Record<string, string> = {
-        SJ_API_KEY: opts.apiKey,
-        SJ_SEC_KEY: opts.secretKey,
         SJ_HTTP_ADDR: `127.0.0.1:${port}`,
         // per-request logs are unbounded (the spawn log file would grow
         // ~100MB/day). SJ_HTTP_LOG=false and its documented fallbacks are
@@ -1091,11 +1166,6 @@ export async function serverStart(opts: {
         SJ_HTTP_LOG: 'false',
         RUST_LOG: 'warn',
     };
-    // CA certificate — required for production orders, ignored in simulation
-    if (opts.caPath) {
-        env.SJ_CA_PATH = opts.caPath;
-        if (opts.caPasswd) env.SJ_CA_PASSWD = opts.caPasswd;
-    }
     // 本機 HTTPS：static TLS turns the listener into https + HTTP/2
     if (tlsReady) {
         const tls = await tlsPaths();
@@ -1111,17 +1181,12 @@ export async function serverStart(opts: {
         port,
         wantScheme,
         opts.agentHarnessEnabled,
+        opts.credentialRevision,
     );
-    if (res.ok) {
-        // remember which credentials THIS spawn was started with (issue #16)
-        // — null (no crypto.subtle) clears the record so a stale hash never
-        // outlives the server it described
-        setStoredSpawnKeyHash(
-            await hashCredentials(opts.apiKey, opts.secretKey),
-        );
-    }
     const schemeChanged = res.ok ? setApiScheme(wantScheme) : false;
     const portChanged = (res.ok ? setApiPort(port) : false) || schemeChanged;
+    // this App's own server now answers here: nothing of it is blocked
+    if (res.ok && foreignServerPortBlocked() === port) blockForeignServerPort(null);
     // the server starts even when CA activation fails (login still works) —
     // catch that warning from the log so the user knows production orders
     // will 400 (e.g. expired certificate) instead of finding out at order time
@@ -1143,12 +1208,15 @@ export async function serverStart(opts: {
             : caFail[0].replace(/.*Failed to activate CA certificate:\s*/i, '');
         note += `\n⚠ CA 未啟用（${reason}）— 正式環境下單會被拒`;
     }
+    if (foreign) note = `\n${foreign.text}；本 App 的伺服器改在 port ${port}${note}`;
     return {
         ...res,
         output: `${res.output}${note}`,
+        ...(res.ok ? {} : { failureOutput: res.output }),
         port,
         attached: false,
         portChanged,
+        ...(foreign ? { foreign } : {}),
     };
 }
 
@@ -1176,6 +1244,7 @@ export async function stopAgentsForServerChange(): Promise<void> {
 // lock and could stop an external server after a new Agent has started.
 export async function serverStop(opts?: {
     stopAgents?: boolean; // explicit UI action only; automatic recovery must not stop agents
+    ownedOnly?: boolean; // account changes may continue alongside an external server
 }): Promise<SidecarResult> {
     if (!isTauri) return { ok: false, output: '' };
     if (opts?.stopAgents) {
@@ -1184,6 +1253,15 @@ export async function serverStop(opts?: {
         catch (e) { return { ok: false, output: `無法停止 Agent：${String(e)}` }; }
     }
     const st = await serverStatus();
+    // #285: never stop a server this App did not start — another App's
+    // (same binary included: the native check would call it ours) or the
+    // user's own CLI daemon
+    if (st?.running && st.port && !(await ownsServer(st))) {
+        return {
+            ok: !!opts?.ownedOnly,
+            output: `:${st.port} 上的伺服器不是本 App 啟動的，本 App 不會停止它；請在啟動它的程式中停止`,
+        };
+    }
     let killNote = '';
     const pid = getServerPid();
     // resolve the victim by port (survives lost pid records from older app
@@ -1239,108 +1317,6 @@ export async function serverStop(opts?: {
     return { ok: true, output: killNote || '伺服器未在運行' };
 }
 
-// ---- settings store (API keys live in the app-data dir, not the repo) ----
-
-export interface DesktopSettings {
-    apiKey: string;
-    secretKey: string;
-    production: boolean;
-    autoStart: boolean; // start the shioaji server when the app launches
-    caPath: string; // Sinopac.pfx — required for production orders
-    caPasswd: string;
-    httpsEnabled: boolean; // serve the sidecar over local HTTPS (mkcert)
-    agentHarnessEnabled: boolean; // runtime-toggleable; no server restart
-}
-
-const EMPTY_SETTINGS: DesktopSettings = {
-    apiKey: '',
-    secretKey: '',
-    production: false,
-    autoStart: true,
-    caPath: '',
-    caPasswd: '',
-    httpsEnabled: false,
-    agentHarnessEnabled: true,
-};
-
-// settings.json holds the API key, secret key and CA password: only the main
-// window may touch it. Child windows (popouts, tray) have no store permission
-// at all and learn only the non-secret "setup done" flag (desktop-setup-state).
-function assertMainWindowSettingsAccess(): void {
-    if (isChildWindow()) {
-        throw new Error('本機設定只能在主視窗讀取或修改');
-    }
-}
-
-let storeModulePromise: Promise<typeof import('@tauri-apps/plugin-store')> | null = null;
-const storeModule = () => (storeModulePromise ??= import('@tauri-apps/plugin-store'));
-
-// boot and the main-window gate both read settings at page start: share one
-// in-flight read (≈10 store IPC calls) instead of doing it twice. Only the
-// pending promise is shared — a later call always reads fresh values.
-let settingsRead: Promise<DesktopSettings> | null = null;
-export function loadDesktopSettings(): Promise<DesktopSettings> {
-    if (!settingsRead) {
-        settingsRead = readDesktopSettings().finally(() => {
-            settingsRead = null;
-        });
-    }
-    return settingsRead;
-}
-
-async function readDesktopSettings(): Promise<DesktopSettings> {
-    if (!isTauri) return { ...EMPTY_SETTINGS };
-    assertMainWindowSettingsAccess();
-    const { LazyStore } = await storeModule();
-    const store = new LazyStore('settings.json');
-    const safeDefaultMigrated =
-        (await store.get<boolean>('agentHarnessSafeDefaultV1')) ?? false;
-    const storedAgentHarnessEnabled = await store.get<boolean>(
-        'agentHarnessEnabled',
-    );
-    const agentHarnessEnabled = resolveAgentHarnessSetting(
-        storedAgentHarnessEnabled,
-        safeDefaultMigrated,
-    );
-    if (!safeDefaultMigrated) {
-        await store.set('agentHarnessEnabled', agentHarnessEnabled);
-        await store.set('agentHarnessSafeDefaultV1', true);
-        await store.save();
-    }
-    const settings = {
-        apiKey: (await store.get<string>('apiKey')) ?? '',
-        secretKey: (await store.get<string>('secretKey')) ?? '',
-        production: (await store.get<boolean>('production')) ?? false,
-        autoStart: (await store.get<boolean>('autoStart')) ?? true,
-        caPath: (await store.get<string>('caPath')) ?? '',
-        caPasswd: (await store.get<string>('caPasswd')) ?? '',
-        httpsEnabled: (await store.get<boolean>('httpsEnabled')) ?? false,
-        agentHarnessEnabled,
-    };
-    cacheAgentHarnessEnabled(settings.agentHarnessEnabled);
-    cacheDesktopConfigured(Boolean(settings.apiKey && settings.secretKey));
-    return settings;
-}
-
-export async function saveDesktopSettings(s: DesktopSettings) {
-    if (!isTauri) return;
-    assertMainWindowSettingsAccess();
-    settingsRead = null; // a read already in flight must not be shared after a save
-    const { LazyStore } = await storeModule();
-    const store = new LazyStore('settings.json');
-    await store.set('apiKey', s.apiKey);
-    await store.set('secretKey', s.secretKey);
-    await store.set('production', s.production);
-    await store.set('autoStart', s.autoStart);
-    await store.set('caPath', s.caPath);
-    await store.set('caPasswd', s.caPasswd);
-    await store.set('httpsEnabled', s.httpsEnabled);
-    await store.set('agentHarnessEnabled', s.agentHarnessEnabled);
-    cacheAgentHarnessEnabled(s.agentHarnessEnabled);
-    await store.save();
-    cacheDesktopConfigured(Boolean(s.apiKey && s.secretKey));
-}
-
 export interface SetAgentHarnessResult {
     // ownership recovery respawned the sidecar (adopted orphan → owned)
     restarted: boolean;
@@ -1390,37 +1366,9 @@ export async function pickCaFile(): Promise<string | null> {
     return typeof file === 'string' ? file : null;
 }
 
-// parses simple KEY=value / KEY="value" / export KEY=value lines — good
-// enough for a hand-written .env, doesn't need full dotenv semantics
-// (multiline values, ${VAR} expansion) for just pulling out two keys
-function parseEnvKeys(
-    text: string,
-): { apiKey?: string; secretKey?: string } {
-    const out: { apiKey?: string; secretKey?: string } = {};
-    for (const raw of text.split(/\r?\n/)) {
-        const line = raw.trim();
-        if (!line || line.startsWith('#')) continue;
-        const m = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(
-            line,
-        );
-        if (!m) continue;
-        const key = m[1];
-        let val = (m[2] ?? '').trim();
-        if (
-            (val.startsWith('"') && val.endsWith('"')) ||
-            (val.startsWith("'") && val.endsWith("'"))
-        ) {
-            val = val.slice(1, -1);
-        }
-        if (key === 'SJ_API_KEY') out.apiKey = val;
-        if (key === 'SJ_SEC_KEY') out.secretKey = val;
-    }
-    return out;
-}
-
 export type EnvSelection = { directory: string; candidates: string[] };
 export type EnvImportResult =
-    | { kind: 'imported'; fileName: string; apiKey?: string; secretKey?: string }
+    | { kind: 'imported'; fileName: string; settings: DesktopSettings; profileId: string }
     | { kind: 'choose'; selection: EnvSelection }
     | { kind: 'error'; error: string };
 
@@ -1442,23 +1390,22 @@ export function envCandidates(names: string[]): string[] {
     );
 }
 
-async function readEnvKeys(path: string, fileName: string): Promise<EnvImportResult> {
-    const { readTextFile } = await import('@tauri-apps/plugin-fs');
-    let text: string;
+async function readEnvKeys(path: string, fileName: string, environment: CredentialEnvironment): Promise<EnvImportResult> {
     try {
-        text = await readTextFile(path);
-    } catch {
-        return { kind: 'error', error: `無法讀取 ${fileName}。${checkedFiles([fileName])}` };
+        const settings = await importCredentialEnv(path, fileName, environment);
+        const profileId = settings.profiles.at(-1)?.id;
+        if (!profileId) return { kind: 'error', error: '匯入後找不到帳號設定。' };
+        return { kind: 'imported', fileName, settings, profileId };
+    } catch (error) {
+        // Native credentials_import_env returns fixed, secret-free strings.
+        if (typeof error === 'string') return { kind: 'error', error };
+        return { kind: 'error', error: '無法匯入 .env；請確認金鑰格式與系統憑證庫。' };
     }
-    const found = parseEnvKeys(text);
-    return found.apiKey || found.secretKey
-        ? { kind: 'imported', fileName, ...found }
-        : { kind: 'error', error: `${fileName} 沒有 SJ_API_KEY / SJ_SEC_KEY。${checkedFiles([fileName])}` };
 }
 
 // File dialogs can hide ".env" on some platforms; selecting its folder and
 // listing entries also lets the user import that hidden file.
-export async function pickEnvFile(mode: 'file' | 'directory'): Promise<EnvImportResult | null> {
+export async function pickEnvFile(mode: 'file' | 'directory', environment: CredentialEnvironment = 'simulation'): Promise<EnvImportResult | null> {
     if (!isTauri) return null;
     const { open } = await import('@tauri-apps/plugin-dialog');
     const selected = await open({
@@ -1470,7 +1417,7 @@ export async function pickEnvFile(mode: 'file' | 'directory'): Promise<EnvImport
     if (mode === 'file') {
         const fileName = fileNameFromPath(selected);
         return envFileName(fileName)
-            ? readEnvKeys(selected, fileName)
+            ? readEnvKeys(selected, fileName, environment)
             : { kind: 'error', error: `${fileName} 不是 .env 檔案。${checkedFiles([fileName])}` };
     }
     const { readDir } = await import('@tauri-apps/plugin-fs');
@@ -1484,15 +1431,15 @@ export async function pickEnvFile(mode: 'file' | 'directory'): Promise<EnvImport
     if (!candidates.length) {
         return { kind: 'error', error: `資料夾裡沒有 .env 檔案。${checkedFiles(names.sort())}` };
     }
-    if (candidates.length === 1) return readEnvKeys(joinEnvPath(selected, candidates[0]!), candidates[0]!);
+    if (candidates.length === 1) return readEnvKeys(joinEnvPath(selected, candidates[0]!), candidates[0]!, environment);
     return { kind: 'choose', selection: { directory: selected, candidates } };
 }
 
-export async function importEnvCandidate(selection: EnvSelection, fileName: string): Promise<EnvImportResult> {
+export async function importEnvCandidate(selection: EnvSelection, fileName: string, environment: CredentialEnvironment = 'simulation'): Promise<EnvImportResult> {
     if (!selection.candidates.includes(fileName)) {
         return { kind: 'error', error: `檔案不在候選清單中。${checkedFiles(selection.candidates)}` };
     }
-    return readEnvKeys(joinEnvPath(selection.directory, fileName), fileName);
+    return readEnvKeys(joinEnvPath(selection.directory, fileName), fileName, environment);
 }
 
 // ---- popout windows ----

@@ -2,7 +2,7 @@
 // 都收斂進統一設定 dialog（settings-dialog.tsx）；header 只留高頻操作：
 // 伺服器狀態、Kill Switch（一鍵鎖定/解鎖）、新增面板、閃電全開、設定。
 
-import { LayoutGrid, Lock, Settings, Unlock, Zap } from 'lucide-react';
+import { LayoutGrid, Lock, Settings, Undo2, Unlock, Zap } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useStreamStatus } from '../hooks/use-stream';
 import { useHeaderItems } from '../lib/header-items';
@@ -21,6 +21,8 @@ import type { Profile, Workspace } from '../lib/workspace';
 import { LayoutLibrary } from './layout-library';
 import { MarketBar } from './market-bar';
 import { ServerManager } from './server-manager';
+import { ForeignServerChip } from './foreign-server-chip';
+import { externalServerLabel, useServerAttachment } from '../lib/server-adoption';
 import { SettingsDialog } from './settings-dialog';
 import { flashPopoutParams, reseedPopoutFlashAccounts } from '../lib/flash-account';
 import { mainFlashSelection } from '../lib/order-account';
@@ -191,6 +193,8 @@ export function HudHeader({
     onRenameProfile,
     onResetWorkspace,
     onLoadPreset,
+    workspaceUndo = null,
+    onUndoWorkspace,
     flashCodes = [],
 }: {
     accBalance?: number;
@@ -204,11 +208,17 @@ export function HudHeader({
     onRenameProfile: (oldName: string, newName: string) => void;
     onResetWorkspace: () => void;
     onLoadPreset: (name: string) => void;
+    // Agent 套用版面規格後可復原的那一步（#331）；null = 沒有可復原的變更
+    workspaceUndo?: { label: string; at: number } | null;
+    onUndoWorkspace?: () => void;
 }) {
     const streamStatus = useStreamStatus();
     const privMoney = usePrivacyMoney();
     const headerItems = useHeaderItems();
     const [simulation, setSimulation] = useState<boolean | null>(null);
+    const attachment = useServerAttachment();
+    // #285: a server another program started is labelled as such
+    const external = attachment.kind === 'external' ? attachment : null;
     const [appVer, setAppVer] = useState('');
     const [now, setNow] = useState(() => new Date());
     const [serverMgrOpen, setServerMgrOpen] = useState(false);
@@ -267,10 +277,15 @@ export function HudHeader({
 
             {simulation !== null &&
                 (simulation ? (
-                    <span className={styles.simBadge}>模擬環境</span>
+                    <span className={styles.simBadge} title={external ? externalServerLabel(external) : undefined}>
+                        模擬環境{external && <span className={styles.externalTag}>· 外部伺服器</span>}
+                    </span>
                 ) : (
-                    <span className={styles.prodBadge}>正式環境</span>
+                    <span className={styles.prodBadge} title={external ? externalServerLabel(external) : undefined}>
+                        正式環境{external && <span className={styles.externalTag}>· 外部伺服器</span>}
+                    </span>
                 ))}
+            <ForeignServerChip />
 
             <MarketBar />
 
@@ -309,6 +324,16 @@ export function HudHeader({
                 >
                     <LayoutGrid size={11} style={{ verticalAlign: '-1px' }} />{' '}
                     版面
+                </button>
+            )}
+            {workspaceUndo && onUndoWorkspace && (
+                <button
+                    className={styles.resetBtn}
+                    title={`復原 Agent 版面變更「${workspaceUndo.label}」（${new Date(workspaceUndo.at).toLocaleTimeString('en-GB', { hour12: false })}）`}
+                    onClick={onUndoWorkspace}
+                >
+                    <Undo2 size={11} style={{ verticalAlign: '-1px' }} />{' '}
+                    復原版面
                 </button>
             )}
             {headerItems.flashAll && flashCodes.length > 0 && (

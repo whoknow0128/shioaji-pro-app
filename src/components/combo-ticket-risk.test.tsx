@@ -1,3 +1,5 @@
+import '../test/mock-order-reconciliation';
+import { operationNotice } from '../test/operation-notice';
 // issue #150 — combo manual send and the 到價監控 auto-send go through the
 // same shared risk checks (Kill Switch / per-order cap / daily loss cap) as
 // the order ticket, flash order and grid. Uses the real risk module.
@@ -33,7 +35,7 @@ vi.mock('../lib/combo-pick', () => ({ useComboPick: () => null }));
 vi.mock('../lib/option-pick', () => ({ useOptionLegPick: () => null }));
 vi.mock('../lib/price-sync', () => ({ usePickedPrice: () => null }));
 vi.mock('../lib/quote-ownership', () => ({ retainContractQuotes: () => () => undefined }));
-vi.mock('../lib/privacy', () => ({ usePrivacyMode: () => false, maskAccountId: (id: string) => id, getPrivacyMoney: () => false, maskMoney: (t: string) => t }));
+vi.mock('../lib/privacy', async (orig) => ({ ...(await orig<typeof import('../lib/privacy')>()), usePrivacyMode: () => false, maskAccountId: (id: string) => id }));
 vi.mock('../lib/contracts-cache', () => ({ ensureContract: async (code: string) => contracts[code] }));
 vi.mock('../lib/shioaji', () => ({
     buildComboContract: vi.fn(),
@@ -68,7 +70,6 @@ let view!: ReactTestRenderer;
 const btn = (label: string) => view.root.findAllByType('button').find((b) => text(b).includes(label))!;
 const input = (placeholder: string) => view.root.findAllByType('input').filter((i) => i.props.placeholder === placeholder);
 const qtyInput = () => view.root.findAllByType('input').find((i) => i.props.inputMode === 'numeric')!;
-const lastNotice = () => m.notify.mock.calls.at(-1)![0];
 const rerender = async () => { await act(async () => { view.update(createElement(ComboTicket)); }); };
 
 const render = async () => {
@@ -94,7 +95,7 @@ type Rule = { name: string; qty: number; apply: () => void; reason: RegExp };
 const rules: Rule[] = [
     { name: 'Kill Switch', qty: 1, apply: () => setRiskSettings({ locked: true }), reason: /風控鎖啟動中/ },
     { name: 'per-order limit', qty: 3, apply: () => setRiskSettings({ enabled: true, maxQty: 2 }), reason: /超過單筆上限 2（本筆 3）/ },
-    { name: 'daily loss limit', qty: 1, apply: () => { setRiskSettings({ enabled: true, maxDailyLoss: 3000 }); reportDailyPnl(-3500); }, reason: /當日虧損 -3500 已達上限 -3000/ },
+    { name: 'daily loss limit', qty: 1, apply: () => { setRiskSettings({ enabled: true, maxDailyLoss: 3000 }); reportDailyPnl(-3500); }, reason: /當日虧損 \u2061?-3500\u2063? 已達上限 -\u2061?3000\u2063?/ },
 ];
 
 beforeEach(() => {
@@ -116,7 +117,7 @@ describe('manual combo send', () => {
         await sendManual();
         expect(m.place).toHaveBeenCalledTimes(1);
         expect(m.place.mock.calls[0]![1]).toMatchObject({ action: 'Buy', price: 50, quantity: 2, price_type: 'LMT', order_type: 'IOC' });
-        expect(lastNotice()).toMatchObject({ kind: 'ok', title: '🧩 組合單已送出' });
+        expect(operationNotice(m.notify, '🧩 組合單已送出')).toMatchObject({ kind: 'ok', title: '🧩 組合單已送出' });
     });
 
     it.each(rules)('is blocked by the $name and shows the reason', async ({ qty, apply, reason }) => {
@@ -125,7 +126,7 @@ describe('manual combo send', () => {
         apply();
         await sendManual();
         expect(m.place).not.toHaveBeenCalled();
-        expect(lastNotice()).toMatchObject({ kind: 'err', title: '風控阻擋', body: expect.stringMatching(reason) });
+        expect(operationNotice(m.notify, '風控阻擋')).toMatchObject({ kind: 'err', title: '風控阻擋', body: expect.stringMatching(reason) });
     });
 });
 
@@ -139,7 +140,7 @@ describe('到價監控 auto-send', () => {
         await rerender();
         expect(m.place).toHaveBeenCalledTimes(1);
         expect(m.place.mock.calls[0]![1]).toMatchObject({ action: 'Buy', price: 40, quantity: 1, order_type: 'IOC' });
-        expect(lastNotice()).toMatchObject({ kind: 'ok', title: '🎯 到價觸發第 1 次' });
+        expect(operationNotice(m.notify, '🎯 到價觸發第 1 次')).toMatchObject({ kind: 'ok', title: '🎯 到價觸發第 1 次' });
         expect(text(btn('監控中'))).toContain('監控中 1/3');
     });
 
@@ -152,8 +153,8 @@ describe('到價監控 auto-send', () => {
         setLegQuotes(62, 64, 100, 102);
         await rerender();
         expect(m.place).not.toHaveBeenCalled();
-        expect(lastNotice()).toMatchObject({ kind: 'err', title: '🎯 到價監控停止', body: expect.stringMatching(reason) });
-        expect(lastNotice().body).toMatch(/^風控阻擋：.*，未送單$/);
+        expect(operationNotice(m.notify, '🎯 到價監控停止')).toMatchObject({ kind: 'err', title: '🎯 到價監控停止', body: expect.stringMatching(reason) });
+        expect(operationNotice(m.notify, '🎯 到價監控停止').body).toMatch(/^風控阻擋：.*，未送單$/);
         expect(btn('啟動監控')).toBeDefined(); // monitor is off
     });
 
@@ -163,7 +164,7 @@ describe('到價監控 auto-send', () => {
         apply();
         await startWatch(55); // 已觸及價位 — 啟動就會送單，必須先擋
         expect(m.place).not.toHaveBeenCalled();
-        expect(lastNotice()).toMatchObject({ kind: 'err', title: '到價監控未啟動', body: expect.stringMatching(reason) });
+        expect(operationNotice(m.notify, '到價監控未啟動')).toMatchObject({ kind: 'err', title: '到價監控未啟動', body: expect.stringMatching(reason) });
         expect(btn('啟動監控')).toBeDefined();
     });
 });
