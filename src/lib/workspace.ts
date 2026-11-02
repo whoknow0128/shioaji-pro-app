@@ -3,6 +3,8 @@
 import type { LayoutItem } from 'react-grid-layout';
 import { isLinkGroup, LINK_GROUPS, type LinkGroupId } from './flash-link';
 import { decodeQuoteBoardFields, encodeQuoteBoardFields } from './quote-board-fields';
+import fileWorkspaceData from '../config/workspace.json';
+import fileProfilesData from '../config/profiles.json';
 
 // 版面座標底座（儲存基準）：288 欄 = 傳統 24 欄 × 12。
 // - 撰寫/舊存檔仍是 24 欄語意，載入時 ×12 無損升階
@@ -1212,11 +1214,30 @@ export function loadWorkspace(): Workspace {
     } catch {
         // fall through
     }
+    
+    // Check file backup
+    try {
+        const w = fileWorkspaceData as unknown as Workspace;
+        if (validWorkspace(w)) {
+            localStorage.setItem(WS_KEY, JSON.stringify(w));
+            return w;
+        }
+    } catch {
+        // ignore
+    }
+    
     return structuredClone(DEFAULT_WORKSPACE);
 }
 
 export function saveWorkspace(w: Workspace) {
     localStorage.setItem(WS_KEY, JSON.stringify(w));
+    if (import.meta.env.DEV) {
+        fetch('/dev-api/save-workspace', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(w)
+        }).catch(() => {});
+    }
 }
 
 export function loadProfiles(): Profile[] {
@@ -1255,11 +1276,31 @@ export function loadProfiles(): Profile[] {
     } catch {
         // fall through
     }
+    
+    // Check file backup
+    try {
+        const p = fileProfilesData as unknown as Profile[];
+        if (Array.isArray(p) && p.length > 0) {
+            const out = parse(JSON.stringify(p), false);
+            if (out) {
+                localStorage.setItem(PROFILES_KEY, JSON.stringify(out));
+                return out;
+            }
+        }
+    } catch {}
+    
     return [];
 }
 
 export function saveProfiles(profiles: Profile[]) {
     localStorage.setItem(PROFILES_KEY, JSON.stringify(profiles));
+    if (import.meta.env.DEV) {
+        fetch('/dev-api/save-profiles', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(profiles)
+        }).catch(() => {});
+    }
 }
 
 let blockCounter = Date.now() % 100000;

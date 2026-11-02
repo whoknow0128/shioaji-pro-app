@@ -59,7 +59,7 @@ let generation = 0;
 
 async function nativeSettings(command: string, args?: Record<string, unknown>): Promise<DesktopSettings> {
     if (isChildWindow()) throw new Error('本機設定只能在主視窗讀取或修改');
-    if (!isTauri) return { ...EMPTY_DESKTOP_SETTINGS, profiles: [] };
+    if (!isTauri) return { ...EMPTY_DESKTOP_SETTINGS, agentHarnessEnabled: false, profiles: [] };
     const { invoke } = await import('@tauri-apps/api/core');
     return invoke<DesktopSettings>(command, args);
 }

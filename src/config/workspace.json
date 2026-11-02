@@ -1,0 +1,194 @@
+{
+  "blocks": [
+    {
+      "id": "watch-2c",
+      "type": "watchlist",
+      "pin": null
+    },
+    {
+      "id": "chart-2ca",
+      "type": "chart",
+      "pin": null,
+      "indicatorState": {
+        "revision": "bf923a87-0234-4997-9378-2bbb9d1d3e56",
+        "instances": [
+          {
+            "id": "multima-muyjgfn6-2oct",
+            "type": "multima",
+            "params": {
+              "maType": 0,
+              "p1": 5,
+              "p2": 10,
+              "p3": 20,
+              "p4": 60,
+              "p5": 100,
+              "p6": 200
+            },
+            "colors": {},
+            "styles": {
+              "ma1": {
+                "visible": false
+              },
+              "ma2": {
+                "visible": false
+              },
+              "ma4": {
+                "visible": true
+              },
+              "ma5": {
+                "visible": false
+              }
+            }
+          },
+          {
+            "id": "kd-muyji465-a0c5",
+            "type": "kd",
+            "params": {
+              "period": 9,
+              "k": 3,
+              "d": 3
+            },
+            "colors": {}
+          },
+          {
+            "id": "boll-mv6r4qya-96ye",
+            "type": "boll",
+            "params": {
+              "period": 30,
+              "mult": 2
+            },
+            "colors": {},
+            "showLabels": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "chart-2cb",
+      "type": "chart",
+      "pin": "TMFR1",
+      "indicatorState": {
+        "revision": "5f5774df-8f1a-4165-a722-aa4cdc9a730a",
+        "instances": [
+          {
+            "id": "multima-muyjgwuq-57lp",
+            "type": "multima",
+            "params": {
+              "maType": 0,
+              "p1": 5,
+              "p2": 10,
+              "p3": 20,
+              "p4": 60,
+              "p5": 100,
+              "p6": 200
+            },
+            "colors": {},
+            "styles": {
+              "ma1": {
+                "visible": false
+              },
+              "ma2": {
+                "visible": false
+              },
+              "ma4": {
+                "visible": false
+              }
+            }
+          },
+          {
+            "id": "kd-muyjieij-47tr",
+            "type": "kd",
+            "params": {
+              "period": 9,
+              "k": 3,
+              "d": 3
+            },
+            "colors": {}
+          },
+          {
+            "id": "boll-mv6r54lm-z4px",
+            "type": "boll",
+            "params": {
+              "period": 30,
+              "mult": 2
+            },
+            "colors": {},
+            "showLabels": true
+          }
+        ]
+      },
+      "chartInterval": "15m"
+    },
+    {
+      "id": "movers-2c",
+      "type": "movers",
+      "pin": null
+    },
+    {
+      "id": "dock-2c",
+      "type": "dock",
+      "pin": null
+    },
+    {
+      "id": "scanner-55236",
+      "type": "scanner",
+      "pin": null
+    }
+  ],
+  "layout": [
+    {
+      "i": "watch-2c",
+      "x": 0,
+      "y": 0,
+      "w": 48,
+      "h": 14,
+      "minW": 36,
+      "minH": 6
+    },
+    {
+      "i": "chart-2ca",
+      "x": 48,
+      "y": 0,
+      "w": 120,
+      "h": 20,
+      "minW": 72,
+      "minH": 7
+    },
+    {
+      "i": "chart-2cb",
+      "x": 168,
+      "y": 0,
+      "w": 120,
+      "h": 20,
+      "minW": 72,
+      "minH": 7
+    },
+    {
+      "i": "movers-2c",
+      "x": 0,
+      "y": 14,
+      "w": 48,
+      "h": 10,
+      "minW": 36,
+      "minH": 5
+    },
+    {
+      "i": "dock-2c",
+      "x": 48,
+      "y": 20,
+      "w": 168,
+      "h": 10,
+      "minW": 72,
+      "minH": 5
+    },
+    {
+      "i": "scanner-55236",
+      "x": 216,
+      "y": 20,
+      "w": 72,
+      "h": 12,
+      "minW": 48,
+      "minH": 8
+    }
+  ]
+}

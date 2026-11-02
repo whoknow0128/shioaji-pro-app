@@ -5,7 +5,7 @@ import { foreignServerBlockedError, serverReadsHeld, serverUrlBlocked } from './
 import { isAgentHarnessEnabled } from './agent-harness-state';
 import { serverIdentityVerified } from './server-identity';
 import { getTradingMirrorFresh } from './trading-mirror-lease';
-import { getServerModeVersion } from './server-info-store';
+import { getServerModeVersion, knownServerInfo } from './server-info-store';
 import { classifyHttpOrderError } from './order-outcome';
 import { isMainWindow } from './main-window-commands';
 import { popoutOrderPost } from './popout-order';
@@ -345,9 +345,9 @@ export async function apiPost<T>(
             { mutationNotStarted: true },
         );
     }
-    if (!isTauri && harnessEnabled && AGENT_HARNESS_MUTATIONS.has(path)) {
+    if (!isTauri && knownServerInfo()?.agent_harness?.enabled === true && AGENT_HARNESS_MUTATIONS.has(path)) {
         throw Object.assign(
-            new Error('為確保安全，Agent Harness 啟用時不允許透過瀏覽器直接下單，請使用桌面版 App (Tauri) 進行測試。'),
+            new Error('為確保安全，後端已啟用 Agent Harness，不允許透過瀏覽器直接下單；請至桌面版 App 設定關閉 Agent Harness，或使用桌面版 App 進行下單。'),
             { mutationNotStarted: true },
         );
     }

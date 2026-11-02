@@ -1,0 +1,90 @@
+[
+  {
+    "code": "TMFR1",
+    "conditions": [
+      {
+        "id": "cond-1791403984331",
+        "type": "kd_d_above",
+        "threshold": 80,
+        "params": {
+          "kd_period": 9,
+          "timeframe": 60
+        }
+      },
+      {
+        "id": "cond-1791404000886",
+        "type": "kd_cross_down",
+        "params": {
+          "kd_period": 9,
+          "timeframe": 60
+        }
+      }
+    ],
+    "action": "alert",
+    "active": true,
+    "repeat": true,
+    "session": "day",
+    "id": "scan-1791404026309-azc1b",
+    "status": "monitoring"
+  },
+  {
+    "code": "TXFR1",
+    "conditions": [
+      {
+        "id": "cond-1791404097331",
+        "type": "kd_d_below",
+        "threshold": 20,
+        "params": {
+          "kd_period": 9,
+          "timeframe": 5
+        }
+      }
+    ],
+    "action": "alert",
+    "active": true,
+    "repeat": true,
+    "session": "day",
+    "id": "scan-1791404109816-vckm1",
+    "status": "monitoring"
+  },
+  {
+    "code": "TMFR1",
+    "conditions": [
+      {
+        "id": "cond-1791425961157",
+        "type": "kd_k_below",
+        "threshold": 20,
+        "params": {
+          "kd_period": 9,
+          "timeframe": 60
+        }
+      }
+    ],
+    "action": "alert",
+    "active": true,
+    "repeat": true,
+    "session": "day",
+    "id": "scan-1791425969815-wpf12",
+    "status": "monitoring"
+  },
+  {
+    "code": "TMFR1",
+    "conditions": [
+      {
+        "id": "cond-1791425983926",
+        "type": "kd_d_below",
+        "threshold": 20,
+        "params": {
+          "kd_period": 9,
+          "timeframe": 60
+        }
+      }
+    ],
+    "action": "alert",
+    "active": true,
+    "repeat": true,
+    "session": "day",
+    "id": "scan-1791425991350-spn1m",
+    "status": "monitoring"
+  }
+]

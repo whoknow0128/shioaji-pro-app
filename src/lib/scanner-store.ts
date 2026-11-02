@@ -78,6 +78,13 @@ function saveTargets() {
     } catch {
         // quota limit
     }
+    if (import.meta.env.DEV) {
+        fetch('/dev-api/save-strategies', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(targets)
+        }).catch(() => {});
+    }
 }
 
 // 初始載入

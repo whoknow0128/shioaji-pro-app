@@ -114,7 +114,48 @@ export default defineConfig(({ mode, command }) => {
                     .trim(),
             ),
         },
-        plugins: [vanillaExtractPlugin(), react()],
+        plugins: [
+            vanillaExtractPlugin(), 
+            react(),
+            {
+                name: 'dev-save-strategies',
+                configureServer(server) {
+                    server.middlewares.use((req, res, next) => {
+                        if (req.method === 'POST' && (req.url === '/dev-api/save-strategies' || req.url === '/dev-api/save-workspace' || req.url === '/dev-api/save-profiles')) {
+                            let body = '';
+                            req.on('data', chunk => body += chunk);
+                            req.on('end', () => {
+                                try {
+                                    // Parse to validate JSON and optionally format it
+                                    const parsed = JSON.parse(body);
+                                    const newContent = JSON.stringify(parsed, null, 2);
+                                    let filename = 'strategies.json';
+                                    if (req.url === '/dev-api/save-workspace') filename = 'workspace.json';
+                                    if (req.url === '/dev-api/save-profiles') filename = 'profiles.json';
+                                    
+                                    const targetPath = path.resolve(__dirname, 'src/config/' + filename);
+                                    let oldContent = '';
+                                    try {
+                                        oldContent = fs.readFileSync(targetPath, 'utf8');
+                                    } catch(e) {}
+                                    
+                                    if (oldContent !== newContent) {
+                                        fs.writeFileSync(targetPath, newContent, 'utf8');
+                                    }
+                                    res.statusCode = 200;
+                                    res.end('OK');
+                                } catch (e) {
+                                    res.statusCode = 500;
+                                    res.end('Error');
+                                }
+                            });
+                        } else {
+                            next();
+                        }
+                    });
+                }
+            }
+        ],
         test: {
             // The desktop overlay is mirrored here for Tauri dev/CI, but its
             // Rust-adjacent Node tests use node:test rather than Vitest.
