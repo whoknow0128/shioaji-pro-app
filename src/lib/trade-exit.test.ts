@@ -200,3 +200,59 @@ it('an odd leg that fails after dispatch is reported as unknown, not as unsent',
     expect(String(err.message)).toContain('零股分單結果未知');
     expect(String(err.message)).not.toContain('零股分單未成立');
 });
+
+const warrant = { code:'030392',security_type:'WRT',exchange:'TSE',limit_down:0.01,limit_up:3.28 } as ContractBase & {limit_down:number;limit_up:number};
+it('exits a warrant position like a stock: whole lots at market on the stock account', async () => {
+    await placeStockExitByShares(warrant,'Sell',2000,account);
+    expect(m.future).not.toHaveBeenCalled();
+    expect(m.stock).toHaveBeenCalledOnce();
+    expect(m.stock.mock.calls[0]![0]).toBe(warrant);
+    expect(m.stock.mock.calls[0]![1]).toMatchObject({quantity:2,order_lot:'Common',price_type:'MKT',order_type:'IOC'});
+    expect(m.stock.mock.calls[0]![2]).toBe(account);
+});
+it('refuses a warrant remainder below one lot before any leg: warrants have no odd lots', async () => {
+    await expect(placeStockExitByShares(warrant,'Sell',1500,account)).rejects.toMatchObject({ mutationNotStarted: true, message: expect.stringContaining('權證沒有零股') });
+    expect(m.confirm).not.toHaveBeenCalled();
+    expect(m.stock).not.toHaveBeenCalled();
+});
+it('quick-orders a warrant on the stock path with stock_order parameters', async () => {
+    await placeQuickOrder(warrant,'Buy',1.68,2,{ account });
+    expect(m.future).not.toHaveBeenCalled();
+    expect(m.stock).toHaveBeenCalledOnce();
+    expect(m.stock.mock.calls[0]![1]).toMatchObject({action:'Buy',price:1.68,quantity:2,price_type:'LMT',order_type:'ROD',order_lot:'Common'});
+});
+
+// 權證規則（docs/qa/warrant-rules.md）：確認前就擋，一筆都不送
+const stkTypedWarrant = { ...warrant, security_type:'STK' } as typeof warrant;
+const foreignWarrant = { code:'03001F',security_type:'WRT',exchange:'TSE',limit_down:0,limit_up:0 } as typeof warrant;
+it.each([['WRT', warrant], ['STK-typed', stkTypedWarrant]] as const)('%s warrant: quick order goes to the stock account, odd lots refused before confirmation', async (_n, c) => {
+    await placeQuickOrder(c,'Buy',5.05,1,{ account });
+    expect(m.stock).toHaveBeenCalledOnce();
+    expect(m.stock.mock.calls[0]![2]).toBe(account);
+    vi.clearAllMocks(); m.confirm.mockResolvedValue(true); m.risk.mockReturnValue(null);
+    await expect(placeQuickOrder(c,'Buy',5.05,100,{ account, orderLot:'IntradayOdd' })).rejects.toMatchObject({ mutationNotStarted: true, message: expect.stringContaining('權證不得零股交易') });
+    expect(m.confirm).not.toHaveBeenCalled();
+    expect(m.stock).not.toHaveBeenCalled();
+});
+it('warrant: credit conditions and day-trade short are refused before confirmation', async () => {
+    await expect(placeQuickOrder(warrant,'Buy',5,1,{ account, orderCond:'MarginTrading' })).rejects.toMatchObject({ mutationNotStarted: true, message: expect.stringContaining('權證只能現股') });
+    await expect(placeQuickOrder(warrant,'Sell',5,1,{ account, daytradeShort:true })).rejects.toMatchObject({ mutationNotStarted: true, message: expect.stringContaining('權證只能現股') });
+    expect(m.confirm).not.toHaveBeenCalled();
+    expect(m.stock).not.toHaveBeenCalled();
+});
+it('domestic warrant market order (has price limits) is allowed: MKT IOC', async () => {
+    await placeQuickOrder(warrant,'Sell',null,1,{ account });
+    expect(m.stock.mock.calls[0]![1]).toMatchObject({price_type:'MKT',order_type:'IOC',order_lot:'Common'});
+});
+it('foreign-underlying warrant: market order refused before confirmation, limit order sent', async () => {
+    await expect(placeQuickOrder(foreignWarrant,'Buy',null,1,{ account })).rejects.toMatchObject({ mutationNotStarted: true, message: expect.stringContaining('外國標的權證無漲跌幅限制') });
+    expect(m.confirm).not.toHaveBeenCalled();
+    expect(m.stock).not.toHaveBeenCalled();
+    await placeQuickOrder(foreignWarrant,'Buy',5.05,1,{ account });
+    expect(m.stock.mock.calls[0]![1]).toMatchObject({price_type:'LMT',price:5.05});
+});
+it('foreign-underlying warrant: one-click market exit refused before confirmation (no price limit to use instead)', async () => {
+    await expect(placeStockExitByShares(foreignWarrant,'Sell',2000,account)).rejects.toMatchObject({ mutationNotStarted: true, message: expect.stringContaining('請在下單面板以限價平倉') });
+    expect(m.confirm).not.toHaveBeenCalled();
+    expect(m.stock).not.toHaveBeenCalled();
+});

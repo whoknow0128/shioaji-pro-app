@@ -8,6 +8,7 @@ import { vanillaExtractPlugin } from '@vanilla-extract/vite-plugin';
 import react from '@vitejs/plugin-react';
 import { defineConfig, loadEnv, searchForWorkspaceRoot } from 'vite';
 import { configDefaults } from 'vitest/config';
+import { etfMetadataProxyPlugin } from './scripts/dev-etf-proxy';
 
 // closed-source modules (AI Agent, future tiered features) live in the
 // private repo, checked out into ./modules on desktop builds; open-source
@@ -117,6 +118,7 @@ export default defineConfig(({ mode, command }) => {
         plugins: [
             vanillaExtractPlugin(), 
             react(),
+            etfMetadataProxyPlugin(),
             {
                 name: 'dev-save-strategies',
                 configureServer(server) {
@@ -187,5 +189,6 @@ export default defineConfig(({ mode, command }) => {
                 '/api': env.VITE_API_TARGET ?? isolatedApi ?? 'http://127.0.0.1:21322',
             },
         },
+        preview: { host: '127.0.0.1' },
     };
 });

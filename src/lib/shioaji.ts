@@ -7,11 +7,13 @@ import { isMainWindow } from './main-window-commands';
 import { remainingWorkingOrderQuantity } from './working-order-quantity';
 import { noteMutationIntent } from './mutation-intent';
 import { isOddLot, ODD_LOT_NO_PRICE_UPDATE, stockOrderProblem } from './odd-lot';
+import { warrantOrderProblem } from './warrant-rules';
 import { futuresOrderProblem } from './order-conditions';
 import { markConfirmedCancellation, observeTradeMutation } from './trade-mutations';
 import { createCancelBatch, readMark, sharedAuthoritativeTrades, verifyCancellation, type CancelBatchMember } from './cancel-verification';
 import { observeMarketSnapshots } from './market-snapshot-store';
 import { observeTradeResponse } from './trade-observations';
+import { noteStockOrderConditions } from './stock-order-conditions';
 import { beginServerInfoRequest, observeServerInfo } from './server-info-store';
 // src/lib/shioaji.ts
 
@@ -57,6 +59,7 @@ import type {
     StockPosition,
 } from './types/portfolio';
 import type { HistoryTicks } from './types/tick';
+import { contractMarket } from './contract-market';
 import { todayStr } from './utils/date';
 
 export interface ServerInfo {
@@ -216,23 +219,25 @@ function contractQuery(params: Record<string, string | number | undefined>) {
     return qs.size ? `?${qs.toString()}` : '';
 }
 
-export function fetchContractBase(code: string, securityType?: SecurityType) {
+export function fetchContractBase(code: string, securityType?: SecurityType, opts?: { signal?: AbortSignal }) {
     const normalized = normalizeContractCode(code, securityType);
     return apiGet<ContractBase>(
         `/api/v1/data/contracts/${encodeURIComponent(normalized)}${contractQuery({
             security_type: securityType ?? undefined,
             region: 'TW',
         })}`,
+        opts,
     );
 }
 
-export function fetchContractInfo(code: string, securityType?: SecurityType) {
+export function fetchContractInfo(code: string, securityType?: SecurityType, opts?: { signal?: AbortSignal }) {
     const normalized = normalizeContractCode(code, securityType);
     return apiGet<ContractInfo>(
         `/api/v1/data/contracts/${encodeURIComponent(normalized)}/info${contractQuery({
             security_type: securityType ?? undefined,
             region: 'TW',
         })}`,
+        opts,
     );
 }
 
@@ -255,8 +260,11 @@ export function fetchContract(
 export async function resolveContract(
     code: string,
     securityType?: SecurityType,
+    opts?: { signal?: AbortSignal },
 ): Promise<ContractInfo> {
-    const base = await fetchContractBase(code, securityType);
+    const base = await fetchContractBase(code, securityType, opts);
+    // Cancellation must also stop the next GET when a transport finishes late.
+    if (opts?.signal?.aborted) throw opts.signal.reason ?? new DOMException('aborted', 'AbortError');
     if (base.security_type === 'WRT') {
         // Warrant info is sharded by underlying and cannot be fetched from
         // /{code}/info. A later warrant search can prime the full record.
@@ -274,13 +282,14 @@ export async function resolveContract(
             short_selling_balance: 0,
         };
     }
-    return fetchContractInfo(base.code, base.security_type);
+    return fetchContractInfo(base.code, base.security_type, opts);
 }
 
 export function fetchContracts(
     securityType: Exclude<SecurityType, null>,
     page?: number,
     pageSize?: number,
+    opts?: { signal?: AbortSignal },
 ) {
     return apiGet<ContractsQueryResponse>(
         `/api/v1/data/contracts${contractQuery({
@@ -289,6 +298,7 @@ export function fetchContracts(
             page,
             page_size: pageSize,
         })}`,
+        opts,
     );
 }
 
@@ -296,7 +306,7 @@ export function fetchFutures(filters: {
     root?: string;
     underlyingCode?: string;
     deliveryMonth?: string;
-} = {}) {
+} = {}, opts?: { signal?: AbortSignal }) {
     return apiGet<ContractInfo[]>(
         `/api/v1/data/contracts/futures${contractQuery({
             root: filters.root,
@@ -304,12 +314,14 @@ export function fetchFutures(filters: {
             delivery_month: filters.deliveryMonth,
             region: 'TW',
         })}`,
+        opts,
     );
 }
 
-export function fetchFuturesRoots() {
+export function fetchFuturesRoots(opts?: { signal?: AbortSignal }) {
     return apiGet<ContractRoot[]>(
         '/api/v1/data/contracts/futures/roots?region=TW',
+        opts,
     );
 }
 
@@ -355,6 +367,7 @@ export function fetchWarrants(
         expiryFrom?: string;
         expiryTo?: string;
     } = {},
+    opts?: { signal?: AbortSignal },
 ) {
     return apiGet<ContractInfo[]>(
         `/api/v1/data/contracts/warrants${contractQuery({
@@ -367,12 +380,14 @@ export function fetchWarrants(
             expiry_to: filters.expiryTo,
             region: 'TW',
         })}`,
+        opts,
     );
 }
 
-export function fetchWarrantUnderlyings() {
+export function fetchWarrantUnderlyings(opts?: { signal?: AbortSignal }) {
     return apiGet<WarrantUnderlying[]>(
         '/api/v1/data/contracts/warrants/underlyings?region=TW&include_name=true',
+        opts,
     );
 }
 
@@ -596,6 +611,13 @@ async function updateCapabilitySubscription(
         }
         if (action === 'unsubscribe' && refs === 0) {
             return { success: true, message: 'Already unsubscribed' };
+        }
+        // the last consumer releases nothing the server should drop (every
+        // stock is still fed under another key): forget the key locally
+        if (action === 'unsubscribe' && Array.isArray(body.stocks) && body.stocks.length === 0) {
+            capabilityRefs.delete(key);
+            unregisterCapabilitySubscription(key);
+            return { success: true, message: 'Nothing to release' };
         }
         let response: CapabilityResponse;
         for (let attempt = 0; ; attempt++) {
@@ -849,13 +871,19 @@ export function placeStockOrder(
 ) {
     // 零股不支援的組合（融資券／當沖／市價／IOC／超過 999 股）與整股信用規則
     // （融券買進、不可當沖的當沖先賣）一律在送出前擋下（#204）
-    const problem = stockOrderProblem({ ...order, day_trade: (contract as { day_trade?: string }).day_trade });
+    // 權證：沒有零股、只能現股、外國標的不收市價（docs/qa/warrant-rules.md）
+    const problem = warrantOrderProblem(contract, order)
+        ?? stockOrderProblem({ ...order, day_trade: (contract as { day_trade?: string }).day_trade });
     if (problem) return Promise.reject(Object.assign(new Error(problem), { mutationNotStarted: true as const }));
     const selected = account ?? accountFor('S');
     return sendOrderMutation<Trade>('/api/v1/order/place_order', {
         contract: contractKey(contract),
         stock_order: { ...order, account: selected },
-    }, selected, opts).then(ensureAccepted).then(trade => observeTradeResponse(trade, selected));
+    }, selected, opts).then(ensureAccepted).then(trade => {
+        // 回報與 update_status 都不帶 daytrade_short：送出時記下條件（委託合計用）
+        noteStockOrderConditions(selected, { seqno: trade.order?.seqno, ordno: trade.order?.ordno }, order);
+        return observeTradeResponse(trade, selected);
+    });
 }
 
 export function placeFuturesOrder(
@@ -923,7 +951,7 @@ async function prepareOrderMutation(tradeId: string, trace: OrderTraceRecord | n
     const account = getAccountState().accounts.find(a => canTrade(a) && reference
         && a.account_type === reference.account_type && a.broker_id === reference.broker_id && a.account_id === reference.account_id);
     if (!account) refuse('缺少已驗證的委託帳戶，未送出改刪單');
-    const futures = ['FUT', 'OPT'].includes(trade.contract.security_type ?? '');
+    const futures = contractMarket(trade.contract.security_type) === 'F';
     if (account!.account_type !== (futures ? 'F' : 'S')) refuse('商品與委託帳戶不符，未送出改刪單');
     traceTrade(trace, trade, trade.account ?? trade.order.account ?? account);
     traceSet(trace, { reconcile: { ran: false } });
