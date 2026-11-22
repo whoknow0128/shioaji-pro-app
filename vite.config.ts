@@ -121,6 +121,14 @@ export default defineConfig(({ mode, command }) => {
             etfMetadataProxyPlugin(),
             {
                 name: 'dev-save-strategies',
+                hotUpdate({ file }) {
+                    const resolved = path.resolve(file);
+                    const configDir = path.resolve(__dirname, 'src/config') + path.sep;
+                    if (resolved.startsWith(configDir) && resolved.endsWith('.json')) {
+                        // Persist config writes to disk without triggering a Vite full-page reload
+                        return [];
+                    }
+                },
                 configureServer(server) {
                     server.middlewares.use((req, res, next) => {
                         if (req.method === 'POST' && (req.url === '/dev-api/save-strategies' || req.url === '/dev-api/save-workspace' || req.url === '/dev-api/save-profiles')) {

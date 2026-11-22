@@ -13,7 +13,7 @@
           "type": "chart",
           "pin": null,
           "indicatorState": {
-            "revision": "bf923a87-0234-4997-9378-2bbb9d1d3e56",
+            "revision": "e60684b7-f587-46e7-b2a8-448b4e8a542a",
             "instances": [
               {
                 "id": "multima-muyjgfn6-2oct",
@@ -62,6 +62,16 @@
                 },
                 "colors": {},
                 "showLabels": true
+              },
+              {
+                "id": "vwmacd-mwkqx7ze-shkh",
+                "type": "vwmacd",
+                "params": {
+                  "fast": 12,
+                  "slow": 26,
+                  "signal": 9
+                },
+                "colors": {}
               }
             ]
           }
@@ -69,9 +79,9 @@
         {
           "id": "chart-2cb",
           "type": "chart",
-          "pin": "TMFR1",
+          "pin": "SRFR2",
           "indicatorState": {
-            "revision": "5f5774df-8f1a-4165-a722-aa4cdc9a730a",
+            "revision": "66c02b05-0987-4dbc-8836-b1dc817d400a",
             "instances": [
               {
                 "id": "multima-muyjgwuq-57lp",
@@ -117,9 +127,20 @@
                 },
                 "colors": {},
                 "showLabels": true
+              },
+              {
+                "id": "vwmacd-mwkqxly3-issq",
+                "type": "vwmacd",
+                "params": {
+                  "fast": 12,
+                  "slow": 26,
+                  "signal": 9
+                },
+                "colors": {}
               }
             ]
-          }
+          },
+          "chartInterval": "60m"
         },
         {
           "id": "movers-2c",
@@ -160,7 +181,7 @@
           "i": "chart-2cb",
           "x": 168,
           "y": 0,
-          "w": 120,
+          "w": 114,
           "h": 20,
           "minW": 72,
           "minH": 7

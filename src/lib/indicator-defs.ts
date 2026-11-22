@@ -24,6 +24,7 @@ import {
     stochRsi,
     supertrend,
     vwap,
+    vwmacd,
     willr,
     wma,
     type IndicatorPoint,
@@ -294,6 +295,29 @@ export const INDICATOR_DEFS: IndicatorDef[] = [
         levels: [0],
         compute: (b, p) => {
             const r = macd(b, p.fast!, p.slow!, p.signal!);
+            return { macd: r.macd, signal: r.signal, hist: r.hist };
+        },
+    },
+    {
+        type: 'vwmacd',
+        label: 'VWMACD 量加權平滑異同',
+        short: 'VWMACD',
+        desc: '以成交量加權均線計算的 MACD，結合量能與趨勢動能',
+        aliases: ['vwmacd', 'volume weighted macd', '量加權macd', '成交量加權macd'],
+        category: 'pane',
+        params: [
+            { key: 'fast', label: '快線', def: 12, min: 1, max: 100 },
+            { key: 'slow', label: '慢線', def: 26, min: 2, max: 200 },
+            { key: 'signal', label: '訊號線', def: 9, min: 1, max: 100 },
+        ],
+        outputs: [
+            { key: 'hist', label: '柱狀', kind: 'histogram', color: '#8b94a7', signed: true },
+            { key: 'macd', label: 'DIF', kind: 'line', color: '#3d8bff' },
+            { key: 'signal', label: 'DEA', kind: 'line', color: '#e0a43c' },
+        ],
+        levels: [0],
+        compute: (b, p) => {
+            const r = vwmacd(b, p.fast!, p.slow!, p.signal!);
             return { macd: r.macd, signal: r.signal, hist: r.hist };
         },
     },

@@ -21,11 +21,11 @@
       }
     ],
     "action": "alert",
-    "active": true,
+    "active": false,
     "repeat": true,
     "session": "day",
     "id": "scan-1791404026309-azc1b",
-    "status": "monitoring"
+    "status": "triggered"
   },
   {
     "code": "TXFR1",
@@ -41,11 +41,11 @@
       }
     ],
     "action": "alert",
-    "active": true,
+    "active": false,
     "repeat": true,
     "session": "day",
     "id": "scan-1791404109816-vckm1",
-    "status": "monitoring"
+    "status": "triggered"
   },
   {
     "code": "TMFR1",
@@ -61,11 +61,11 @@
       }
     ],
     "action": "alert",
-    "active": true,
+    "active": false,
     "repeat": true,
     "session": "day",
     "id": "scan-1791425969815-wpf12",
-    "status": "monitoring"
+    "status": "triggered"
   },
   {
     "code": "TMFR1",
@@ -81,10 +81,10 @@
       }
     ],
     "action": "alert",
-    "active": true,
+    "active": false,
     "repeat": true,
     "session": "day",
     "id": "scan-1791425991350-spn1m",
-    "status": "monitoring"
+    "status": "triggered"
   }
 ]

@@ -385,6 +385,58 @@ export function macd(
     return { macd: macdLine, signal, hist };
 }
 
+export function vwma(bars: Candle[], period: number): IndicatorPoint[] {
+    const out: IndicatorPoint[] = [];
+    let pvSum = 0;
+    let vSum = 0;
+    let cSum = 0;
+    for (let i = 0; i < bars.length; i++) {
+        const b = bars[i]!;
+        pvSum += b.close * b.volume;
+        vSum += b.volume;
+        cSum += b.close;
+        if (i >= period) {
+            const old = bars[i - period]!;
+            pvSum -= old.close * old.volume;
+            vSum -= old.volume;
+            cSum -= old.close;
+        }
+        if (i >= period - 1) {
+            out.push({
+                time: b.time,
+                value: vSum > 0 ? pvSum / vSum : cSum / period,
+            });
+        }
+    }
+    return out;
+}
+
+export function vwmacd(
+    bars: Candle[],
+    fast = 12,
+    slow = 26,
+    signalPeriod = 9,
+): { macd: IndicatorPoint[]; signal: IndicatorPoint[]; hist: IndicatorPoint[] } {
+    const fastV = vwma(bars, fast);
+    const slowV = vwma(bars, slow);
+    const fastAt = new Map(fastV.map((p) => [p.time, p.value!]));
+    const macdLine: IndicatorPoint[] = [];
+    for (const p of slowV) {
+        const f = fastAt.get(p.time);
+        if (f === undefined || p.value === undefined) continue;
+        macdLine.push({ time: p.time, value: f - p.value });
+    }
+    const signal = emaOf(macdLine, signalPeriod);
+    const sigAt = new Map(signal.map((p) => [p.time, p.value!]));
+    const hist: IndicatorPoint[] = [];
+    for (const p of macdLine) {
+        const s = sigAt.get(p.time);
+        if (s === undefined || p.value === undefined) continue;
+        hist.push({ time: p.time, value: p.value - s });
+    }
+    return { macd: macdLine, signal, hist };
+}
+
 // KD（Stochastic）台股慣用 (9,3,3)：RSV 的 SMA 平滑
 export function stoch(
     bars: Candle[],
