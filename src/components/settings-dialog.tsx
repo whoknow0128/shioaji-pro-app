@@ -48,6 +48,7 @@ import {
     useRiskSettings,
 } from '../lib/risk';
 import { isTauri } from '../lib/runtime';
+import { setUsPnlSession, useUsPnlSession, type UsPnlSession } from '../lib/us/us-pnl-prefs';
 import { setSoundEnabled, soundEnabled } from '../lib/sounds';
 import {
     setThemeSettings,
@@ -109,6 +110,11 @@ type SettingsTab =
     | 'risk'
     | 'agent'
     | 'layout';
+
+const US_PNL_SESSION_OPTIONS: { key: UsPnlSession; label: string; title: string }[] = [
+    { key: 'all', label: '含盤前盤後', title: '盤前／盤中／盤後的成交都更新美股庫存損益（預設）' },
+    { key: 'regular', label: '只用一般盤', title: '只用一般盤（09:30–16:00 美東）成交計價；延長時段不更新' },
+];
 
 const TABS: { key: SettingsTab; label: string; icon: React.ReactNode }[] = [
     { key: 'appearance', label: '外觀', icon: <Palette size={13} /> },
@@ -303,7 +309,7 @@ function SoundPrivacySection() {
 }
 
 export function AccountsSection() {
-    const { accounts, selectedStock, selectedFutures, loaded, loadError } = useAccounts();
+    const { accounts, selectedStock, selectedFutures, selectedIntl, loaded, loadError } = useAccounts();
     const simulation = useServerInfo()?.simulation === true;
     const priv = usePrivacyMode();
     const [refreshing, setRefreshing] = useState(false);
@@ -311,7 +317,7 @@ export function AccountsSection() {
     const unsignedTypes = (['S', 'F'] as const).filter((t) =>
         accounts.some((a) => a.account_type === t && !a.signed),
     );
-    const groups: { label: string; type: 'S' | 'F'; selected: string }[] = [
+    const groups: { label: string; type: 'S' | 'F' | 'H'; selected: string }[] = [
         {
             label: '證券帳戶',
             type: 'S',
@@ -324,6 +330,14 @@ export function AccountsSection() {
             type: 'F',
             selected: selectedFutures
                 ? `${selectedFutures.broker_id}-${selectedFutures.account_id}`
+                : '',
+        },
+        {
+            // 複委託（美股）：只用在美股下單面板與美股委託
+            label: '複委託帳戶（美股）',
+            type: 'H',
+            selected: selectedIntl
+                ? `${selectedIntl.broker_id}-${selectedIntl.account_id}`
                 : '',
         },
     ];
@@ -433,6 +447,7 @@ export function AccountsSection() {
 function RiskSection() {
     const risk = useRiskSettings();
     const hoverPricePick = useChartHoverPricePick();
+    const usPnlSession = useUsPnlSession();
     const dailyPnl = getDailyPnl();
     // 金額遮蔽也要蓋住這裡的損益估算 — 隱私開關不該在設定 dialog 裡漏底
     const privMoney = usePrivacyMoney();
@@ -484,6 +499,8 @@ function RiskSection() {
                 （持倉未實現＋期貨平倉）
                 <br />
                 停損/停利觸價單不受風控封鎖。
+                <br />
+                美股（複委託）只受 Kill Switch 封鎖，單筆上限與日虧上限只算台股／期貨。
                 <br />
                 Kill Switch（鎖定下單）在畫面右上角「風控」鈕，一鍵鎖定/解鎖。
             </span>
@@ -541,6 +558,28 @@ function RiskSection() {
             </div>
             <span className={hud.emptyHint}>
                 {'預設關閉，避免游標掃過圖表時改寫已填好的委託價；關閉時仍可點擊 K 線圖或五檔帶價。'}
+            </span>
+            <span className={hud.settingLabel} id='us-pnl-session-label'>美股損益計價 US P&amp;L Price</span>
+            <div
+                className={hud.settingGroup}
+                role='group'
+                aria-labelledby='us-pnl-session-label'
+            >
+                {US_PNL_SESSION_OPTIONS.map((o) => (
+                    <button
+                        key={o.key}
+                        className={hud.opt[usPnlSession === o.key ? 'on' : 'off']}
+                        title={o.title}
+                        aria-pressed={usPnlSession === o.key}
+                        onClick={() => setUsPnlSession(o.key)}
+                    >
+                        {o.label}
+                    </button>
+                ))}
+            </div>
+            <span className={hud.emptyHint}>
+                美股庫存的現價與未實現損益隨即時成交更新。預設含盤前／盤後成交；選「只用一般盤」時忽略延長時段，
+                以今天最後一筆一般盤成交計價，今天還沒有一般盤成交時用前一個一般盤收盤。
             </span>
             <span className={hud.settingLabel}>快捷鍵 Hotkeys</span>
             <div className={hud.switchRow}>

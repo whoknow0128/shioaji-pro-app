@@ -1,6 +1,7 @@
 // src/lib/types/portfolio.ts — account/position shapes
 
-export type AccountTypeName = 'S' | 'F';
+// H = 複委託（美股）帳戶；broker_id／account_id 可能和 S 相同，一律明確帶 account_type
+export type AccountTypeName = 'S' | 'F' | 'H';
 
 export interface Account {
     account_type: string;
@@ -58,6 +59,10 @@ export interface AccountFunds {
     margin?: Margin;
     updatedAt?: number;
     error?: string;
+    /** 券商原始錯誤訊息（tooltip 用） */
+    rawError?: string;
+    /** 期貨保證金失敗為暫時性／未開放（TKAP01 6044、503、AS400）；真錯誤時不設 */
+    errorKind?: 'temporary' | 'unavailable';
 }
 
 export interface Margin {

@@ -15,8 +15,17 @@ import * as dock from './bottom-dock.css';
 import * as panel from './panel.css';
 import * as styles from './pnl-panel.css';
 import { AsyncStatus } from './async-status';
+import { AccountQueryFailure } from './account-query-failure';
+import { classifyAccountQueryError } from '../lib/trading-limits-error';
+import { useServerInfo } from '../lib/server-info-store';
+import { UsRealizedPnlSection } from './us-account-panels';
+import type { ProfitLoss } from '../lib/shioaji';
+import { twIsoDate } from '../lib/tw-account-detail';
+import { profitLossCacheKey, withProfitLossCache } from '../lib/profit-loss-cache-lock';
+import { TwRealizedTable, type TwRealizedRow } from './tw-account-detail';
 
-interface PnlRow {
+interface PnlRow extends TwRealizedRow {
+    /** YYYY-MM-DD（期貨回 YYYYMMDD、股票回 YYYY-MM-DD，統一後才能排序） */
     date: string;
     pnl: number;
 }
@@ -25,14 +34,17 @@ async function fetchPnl(accounts: Account[]): Promise<PnlRow[]> {
     const query = createAccountQuery();
     const rows: PnlRow[] = [];
     for (const account of accounts) {
-        const result = await query.read(account.account_type as 'S' | 'F', account, current => apiPost<PnlRow[]>('/api/v1/portfolio/profit_loss', {
+        const market = account.account_type as 'S' | 'F';
+        // 和沖銷明細共用 sidecar 的 profit_loss 快取：同帳戶依序執行
+        const result = await query.read(market, account, current => withProfitLossCache(profitLossCacheKey(current, market), () => apiPost<ProfitLoss[]>('/api/v1/portfolio/profit_loss', {
             begin_date: dateStrOffset(30), end_date: dateStrOffset(0),
             account_type: current.account_type, broker_id: current.broker_id,
-            account_id: current.account_id, ...(current.account_type === 'S' ? { unit: 'Common' } : {}),
-        }, { beforeDispatch: query.assertCurrent }));
-        rows.push(...result);
+            // 股票用股數（Share）：Common 會把零股截成 0 張；損益金額不受 unit 影響
+            account_id: current.account_id, ...(current.account_type === 'S' ? { unit: 'Share' } : {}),
+        }, { beforeDispatch: query.assertCurrent })));
+        for (const r of result) rows.push({ account, market, row: r, date: twIsoDate(r.date), pnl: Number(r.pnl) || 0 });
     }
-    return rows.map(r => ({ date: r.date, pnl: Number(r.pnl) || 0 })).sort((a, b) => a.date.localeCompare(b.date));
+    return rows.sort((a, b) => a.date.localeCompare(b.date));
 }
 
 function EquityCurve({ rows }: { rows: PnlRow[] }) {
@@ -84,12 +96,24 @@ export function PnlPanel() {
     const { accounts } = useAccounts();
     const privMoney = usePrivacyMoney();
     const tradable = accounts.filter(a => canTrade(a) && ['S', 'F'].includes(a.account_type));
+    // 美股（H）另列 USD，不和台幣相加
+    const usAccts = accounts.filter(a => canTrade(a) && a.account_type === 'H');
+    const usSection = usAccts.length > 0 ? <UsRealizedPnlSection accounts={usAccts} /> : null;
     const key = tradable.map(a => `${a.account_type}:${a.broker_id}:${a.account_id}`).join(',');
-    const { data, error, loading, refresh } = useQuery<PnlRow[]>(
+    const { data, error, loading, refresh, updatedAt } = useQuery<PnlRow[]>(
         useCallback(() => fetchPnl(tradable), [key]), `pnl-30d:${key}`, tradable.length > 0, tradable,
     );
+    // 已實現損益經券商 TKAP01 損益後台／r6：夜間偶發 503、6044（裸 500）、AS400 未連線
+    // 是暫時性／未開放，灰字＋原始訊息放 title；其他才是查詢失敗
+    // 模擬環境不走券商後台，錯誤照舊（不分類）
+    const sim = useServerInfo()?.simulation === true;
+    const errorKind = sim ? null : classifyAccountQueryError(error);
     const controls = <div className={panel.refreshToolbar}>
-        {error && <span role="status">查詢失敗，保留上次資料：{error}</span>}
+        {error && data && (errorKind
+            ? <span role="status" className={dock.acctHint} title={error}>
+                {errorKind === 'unavailable' ? '券商損益服務目前未開放' : '券商暫時查不到資料'}，保留上次資料
+            </span>
+            : <span role="status">查詢失敗，保留上次資料：{error}</span>)}
         <RefreshButton label="更新已實現損益" loading={loading} disabled={tradable.length === 0} onClick={() => void refresh()} />
     </div>;
     const rows = data ?? [];
@@ -109,11 +133,11 @@ export function PnlPanel() {
     if (rows.length === 0) {
         return (
             <div className={panel.panelBody}>{controls}<div className={dock.emptyState}>
-                <AsyncStatus
-                    phase={loading && !data ? 'loading' : error && !data ? 'error' : data ? 'empty' : 'idle'}
-                    text={loading && !data ? '載入已實現損益…' : error && !data ? '損益資料無法取得' : data ? '近 30 日無已實現損益' : '尚無帳戶資料'}
-                />
-            </div></div>
+                {error && !data && !loading ? <AccountQueryFailure what='損益' error={error} kind={errorKind} onRetry={() => void refresh()} /> : <AsyncStatus
+                    phase={loading && !data ? 'loading' : data ? 'empty' : 'idle'}
+                    text={loading && !data ? '載入已實現損益…' : data ? '近 30 日無已實現損益' : '尚無帳戶資料'}
+                />}
+            </div>{usSection}</div>
         );
     }
 
@@ -163,6 +187,11 @@ export function PnlPanel() {
                     </span>
                 </div>
             </div>
+            <section aria-label='台股已實現損益明細' className={dock.acctSection}>
+                <div className={dock.usNote}>台股 30 日已實現損益（點列展開沖銷明細）</div>
+                <TwRealizedTable rows={[...rows].reverse()} priv={privMoney} version={updatedAt ?? 0} />
+            </section>
+            {usSection}
         </div>
     );
 }

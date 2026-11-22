@@ -10,9 +10,78 @@ const QCREDIT_QUERY_FAIL = /\bQCredit\s*:?\s*Query\s*fail\b/i;
 const START_TIME = /\bStartTime\s*[=:]\s*\d+/i;
 const END_TIME = /\bEndTime\s*[=:]\s*\d+/i;
 
+// App 自己在送出當下發現已出時段、沒有送出查詢時用的訊息；視同時段錯誤
+export const TRADING_LIMITS_NOT_SENT = '非交易時段，交易額度查詢未送出';
+
 export function isTradingLimitsWindowError(message: string | null | undefined): boolean {
+    if (message === TRADING_LIMITS_NOT_SENT) return true;
     return !!message
         && QCREDIT_QUERY_FAIL.test(message)
         && START_TIME.test(message)
         && END_TIME.test(message);
+}
+
+// 夜間／非服務時段券商主機（AS400）沒接上時，QCredit 與其他帳務查詢回：
+//   500 Query error: QCredit:Query fail{no AS400Query Connection (RouteID=M|N, WebID=094, MachineID=H05)}
+// 這是「券商服務目前未開放」，不是查詢真的失敗；只認 AS400 連線這個關鍵片段，
+// 其他 QCredit 失敗（timeout、session 斷線）仍是真錯誤。
+const NO_AS400_CONNECTION = /\bno\s+AS400\s*Query\s+Connection\b/i;
+
+export function isBrokerServiceUnavailableError(message: string | null | undefined): boolean {
+    return !!message && NO_AS400_CONNECTION.test(message);
+}
+
+/**
+ * 券商帳務查詢錯誤分類：
+ * - 'window'：明寫服務時段（StartTime/EndTime）→ 顯示「非交易時段」提示
+ * - 'unavailable'：AS400 未連線 → 顯示「券商服務目前未開放」灰字
+ * - null：真正的失敗，照常顯示錯誤與重試
+ */
+export type BrokerQueryErrorKind = 'window' | 'unavailable' | null;
+
+export function classifyBrokerQueryError(message: string | null | undefined): BrokerQueryErrorKind {
+    if (isTradingLimitsWindowError(message)) return 'window';
+    if (isBrokerServiceUnavailableError(message)) return 'unavailable';
+    return null;
+}
+
+// 經券商 TKAP01 損益後台／r6 的台股帳務查詢（交割、預收券款／圈存、已實現損益、
+// 持倉、期貨保證金；不設時段閘門）的暫時性失敗：
+// - HTTP 503（sw 之後可能把 TKAP01 暫時錯誤改成 503 並帶原訊息）
+// - TKAP01 6044「無法取得交易狀態」（帶原訊息時）
+// - 目前 6044 只以 HTTP 500、內容只有 "Internal Server Error" 送回 — 只認這個
+//   「整段就是 500 Internal Server Error」的情形；帶其他訊息的 500 仍是真錯誤。
+// 只給上列帳務查詢用（呈現在 components/account-query-failure.tsx）：其他地方的裸 500
+// 不能當成暫時性。
+const HTTP_503 = /^503\b/;
+// 裸 "500"：HTTP/2 或 Tauri 的回應可能沒有 statusText，throwApiError 只剩狀態碼
+const BARE_500 = /^500(\s+Internal\s+Server\s+Error)?$/i;
+// 6044 必須跟 TKAP01／錯誤碼欄位相鄰，避免帳號、數量等其他數字誤判
+const TKAP01_NO_TRADE_STATUS = /無法取得交易狀態|\bTKAP01\D{0,8}6044\b|\berror_?code\W{0,4}6044\b/i;
+
+export type AccountQueryErrorKind = BrokerQueryErrorKind | 'temporary';
+
+/**
+ * 多帳戶／多支查詢並行時，挑出要拋出的那個錯誤：只要有一個不是暫時性的真錯誤就拋它，
+ * 全部都是暫時性才拋第一個。避免先到的 503 蓋掉同一批裡真正的錯誤。
+ */
+export function pickAccountQueryError(reasons: readonly unknown[]): unknown {
+    const text = (e: unknown) => (e instanceof Error ? e.message : String(e));
+    return reasons.find(e => !classifyAccountQueryError(text(e))) ?? reasons[0];
+}
+
+/** 等所有查詢結束；有失敗就依 pickAccountQueryError 拋出，否則回傳全部結果 */
+export async function settleAccountQueries<T extends unknown[]>(queries: [...{ [K in keyof T]: Promise<T[K]> }]): Promise<T> {
+    const results = await Promise.allSettled(queries);
+    const failed = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected').map(r => r.reason as unknown);
+    if (failed.length) throw pickAccountQueryError(failed);
+    return results.map(r => (r as PromiseFulfilledResult<unknown>).value) as T;
+}
+
+export function classifyAccountQueryError(message: string | null | undefined): AccountQueryErrorKind {
+    const broker = classifyBrokerQueryError(message);
+    if (broker || !message) return broker;
+    const m = message.trim();
+    if (HTTP_503.test(m) || BARE_500.test(m) || TKAP01_NO_TRADE_STATUS.test(m)) return 'temporary';
+    return null;
 }

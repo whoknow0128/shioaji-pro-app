@@ -23,12 +23,14 @@ import {
     registerCapabilitySubscription,
     registerSubscription,
     registerSubscriptionRaw,
+    retainUsQuoteStreams,
     unregisterCapabilitySubscription,
     unregisterSubscription,
 } from './stream';
 import type {
     ContractBase,
     ContractInfo,
+    Region,
     SecurityType,
     TickBandsResponse,
 } from './types/contract';
@@ -61,6 +63,9 @@ import type {
 import type { HistoryTicks } from './types/tick';
 import { contractMarket } from './contract-market';
 import { todayStr } from './utils/date';
+import { profitLossCacheKey, withProfitLossCache } from './profit-loss-cache-lock';
+import { usLinkKey } from './contract-key';
+import { usSubscriptionBody } from './us/us-quotes';
 
 export interface ServerInfo {
     name: string;
@@ -72,6 +77,14 @@ export interface ServerInfo {
     instance_id?: string;
     agent_harness?: Health['agent_harness'];
 }
+
+/** 美股合約（region US）：beta 沒有即時報價，也不走台股下單路徑 */
+export function isUsContract(c: Pick<ContractBase, 'region'> | null | undefined): boolean {
+    return c?.region === 'US';
+}
+
+const US_NO_QUOTES = '美股這個版本沒有即時行情';
+const US_TW_ORDER_PATH = '美股請用下單或閃電面板下單；這個下單路徑只支援台股';
 
 function contractKey(c: ContractBase) {
     return {
@@ -394,6 +407,7 @@ export function fetchWarrantUnderlyings(opts?: { signal?: AbortSignal }) {
 // ---- market data ----
 
 export function fetchSnapshots(contracts: ContractBase[]) {
+    if (contracts.some(isUsContract)) return Promise.reject(new Error(US_NO_QUOTES));
     return observeMarketSnapshots(contracts, apiPost<Snapshot[]>('/api/v1/data/snapshots', {
         contracts: contracts.map(marketDataContract),
     }));
@@ -410,6 +424,7 @@ export async function fetchKbars(
     end: string,
     opts?: { timeoutMs?: number },
 ): Promise<KBars> {
+    if (isUsContract(contract)) throw new Error(US_NO_QUOTES);
     const body = { contract: marketDataContract(contract), start, end };
     for (let attempt = 0; ; attempt++) {
         try {
@@ -468,12 +483,27 @@ export interface QuoteSubscribeOptions {
     oddLot?: boolean;
 }
 
+// 美股訂閱期間保持獨立的美股 SSE（key：US:CODE:quoteType）
+const usStreamHolds = new Map<string, () => void>();
+
 export function subscribeQuote(
     contract: ContractBase,
     quoteType: QuoteTypeName,
     options?: QuoteSubscribeOptions,
 ) {
     const oddLot = options?.oddLot === true;
+    // 美股（SDK 1.8.0b1）：只有 Tick／BidAsk，沒有零股分流
+    if (isUsContract(contract)) {
+        if (oddLot || quoteType === 'Quote') return Promise.reject(new Error(US_NO_QUOTES));
+        const body = usSubscriptionBody(contract, quoteType);
+        return apiPost<SubscriptionResponse>('/api/v1/stream/subscribe', body).then((response) => {
+            if (!response.success) throw new Error(response.message || '美股行情訂閱失敗');
+            const holdKey = `${usLinkKey(contract.code)}:${quoteType}`;
+            registerSubscriptionRaw(usLinkKey(contract.code), quoteType, body);
+            if (!usStreamHolds.has(holdKey)) usStreamHolds.set(holdKey, retainUsQuoteStreams());
+            return response;
+        });
+    }
     // 組合商品走巢狀腳訂閱（flat code 如 TXFI6/J6 server 不認）
     const comboMeta = (contract as { combo?: unknown }).combo;
     if (comboMeta) {
@@ -507,6 +537,17 @@ export function unsubscribeQuote(
     options?: QuoteSubscribeOptions,
 ) {
     const oddLot = options?.oddLot === true;
+    if (isUsContract(contract)) {
+        if (oddLot || quoteType === 'Quote') return Promise.resolve({ success: true, message: '' } as SubscriptionResponse);
+        return apiPost<SubscriptionResponse>('/api/v1/stream/unsubscribe', usSubscriptionBody(contract, quoteType)).then((response) => {
+            if (!response.success) throw new Error(response.message || '取消行情訂閱失敗');
+            const holdKey = `${usLinkKey(contract.code)}:${quoteType}`;
+            unregisterSubscription(usLinkKey(contract.code), quoteType);
+            usStreamHolds.get(holdKey)?.();
+            usStreamHolds.delete(holdKey);
+            return response;
+        });
+    }
     const comboMeta = (contract as { combo?: unknown }).combo;
     if (comboMeta && !oddLot) {
         return unsubscribeComboQuote(
@@ -810,7 +851,7 @@ export function unsubscribeMarketSignal(
 
 /** Every mutation shares this dispatch gate. Re-read the wire account from
  * the current list and the current mode, including after transport loading. */
-function sendOrderMutation<T>(
+export function sendOrderMutation<T>(
     path: string,
     body: unknown,
     account: Account | undefined,
@@ -869,6 +910,9 @@ export function placeStockOrder(
     account?: Account,
     opts?: { agentInitiated?: boolean; agentCallId?: string; agentAuto?: boolean; beforeDispatch?: () => void; onResponse?: (res: Response) => void },
 ) {
+    // 美股不走這條路（grid／括號單／觸價／背景引擎／Agent 都經過這裡）：
+    // 這裡的 order_lot／order_cond／custom_field 美股都會被拒
+    if (isUsContract(contract)) return Promise.reject(Object.assign(new Error(US_TW_ORDER_PATH), { mutationNotStarted: true as const }));
     // 零股不支援的組合（融資券／當沖／市價／IOC／超過 999 股）與整股信用規則
     // （融券買進、不可當沖的當沖先賣）一律在送出前擋下（#204）
     // 權證：沒有零股、只能現股、外國標的不收市價（docs/qa/warrant-rules.md）
@@ -892,6 +936,7 @@ export function placeFuturesOrder(
     account?: Account,
     opts?: { agentInitiated?: boolean; agentCallId?: string; agentAuto?: boolean; beforeDispatch?: () => void },
 ) {
+    if (isUsContract(contract)) return Promise.reject(Object.assign(new Error(US_TW_ORDER_PATH), { mutationNotStarted: true as const }));
     // 倉別／效期／價別不在下單面板提供的範圍就不送（與下單面板、閃電同一套規則）
     const problem = futuresOrderProblem(order);
     if (problem) return Promise.reject(Object.assign(new Error(problem), { mutationNotStarted: true as const }));
@@ -1162,14 +1207,15 @@ export interface AccountSelector {
     account_id: string;
 }
 
-function accountQueryPost<T>(path: string, type: AccountTypeName, selector?: AccountSelector, extra: Record<string, unknown> = {}): Promise<T> {
+function accountQueryPost<T>(path: string, type: AccountTypeName, selector?: AccountSelector, extra: Record<string, unknown> = {},
+    guard?: () => void): Promise<T> {
     const query = createAccountQuery();
     return query.read(type, selector, account => apiPost<T>(path, {
         ...extra,
         account_type: type,
         broker_id: account.broker_id,
         account_id: account.account_id,
-    }, { beforeDispatch: query.assertCurrent }));
+    }, { beforeDispatch: () => { query.assertCurrent(); guard?.(); } }));
 }
 
 export interface FetchTradesOptions {
@@ -1211,6 +1257,17 @@ export function fetchPositions(
         { unit: accountType === 'S' ? 'Share' : 'Common' });
 }
 
+/** 台股庫存明細（逐筆成交批次）：`detail_id` 是 sidecar 最近一次 position_unit 回傳的列 `id`。
+ *  股票的 quantity 由券商以「張」計（SDK 不帶 unit，未滿 1 張的零股會是 0）；期貨為口數。
+ *  模擬環境 SDK 直接回空陣列、不送出請求。 */
+export function fetchPositionDetail(
+    accountType: 'S' | 'F',
+    account: AccountSelector,
+    detailId: number,
+) {
+    return accountQueryPost<unknown>('/api/v1/portfolio/position_detail', accountType, account, { detail_id: detailId });
+}
+
 export function fetchAccountBalance(account?: AccountSelector) {
     return accountQueryPost<AccountBalance>('/api/v1/portfolio/account_balance', 'S', account);
 }
@@ -1244,6 +1301,8 @@ export interface StockProfitLoss {
     dseq: string;
     price: number;
     pr_ratio: number;
+    /** 1.8+：百分比（5.55 代表 5.55%）；舊版只有 pr_ratio（分數） */
+    pnl_pct?: number;
     cond: string;
     seqno: string;
 }
@@ -1263,15 +1322,44 @@ export interface FutureProfitLoss {
 
 export type ProfitLoss = StockProfitLoss | FutureProfitLoss;
 
+function rawProfitLoss(accountType: AccountTypeName, account: AccountSelector | undefined, beginDate: string, endDate: string, unit?: 'Common' | 'Share') {
+    return accountQueryPost<ProfitLoss[]>('/api/v1/portfolio/profit_loss', accountType, account, {
+        begin_date: beginDate,
+        end_date: endDate,
+        ...(unit && accountType === 'S' ? { unit } : {}),
+    });
+}
+
 export function fetchProfitLoss(
     accountType: AccountTypeName,
     account?: AccountSelector,
     beginDate = todayStr(),
     endDate = todayStr(),
+    /** 股票數量單位：Share 回股數（零股不被截成 0 張）；未給沿用 SDK 預設 Common（張） */
+    unit?: 'Common' | 'Share',
 ) {
-    return accountQueryPost<ProfitLoss[]>('/api/v1/portfolio/profit_loss', accountType, account, {
-        begin_date: beginDate,
-        end_date: endDate,
+    // 和沖銷明細共用 sidecar 快取：同帳戶依序執行（見 profit-loss-cache-lock）
+    return withProfitLossCache(profitLossCacheKey(account, accountType),
+        () => rawProfitLoss(accountType, account, beginDate, endDate, unit));
+}
+
+/**
+ * 沖銷明細：先查 `day` 當天的 profit_loss（換掉 sidecar 快取），用 `pick` 找回那一列現在的 id，
+ * 再查 profit_loss_detail。兩次查詢之間不讓本 App 同帳戶的其他 profit_loss 插隊。
+ * `pick` 回 null 時不查明細，回 null。
+ */
+export function fetchProfitLossDetailOf(
+    accountType: 'S' | 'F',
+    account: AccountSelector,
+    day: string,
+    pick: (rows: ProfitLoss[]) => ProfitLoss | undefined,
+): Promise<{ row: ProfitLoss; detail: unknown } | null> {
+    const unit = accountType === 'S' ? 'Share' : 'Common';
+    return withProfitLossCache(profitLossCacheKey(account, accountType), async () => {
+        const row = pick(await rawProfitLoss(accountType, account, day, day, accountType === 'S' ? 'Share' : undefined));
+        if (!row) return null;
+        const detail = await accountQueryPost<unknown>('/api/v1/portfolio/profit_loss_detail', accountType, account, { detail_id: row.id, unit });
+        return { row, detail };
     });
 }
 
@@ -1349,8 +1437,9 @@ export interface TradingLimits {
     short_available: number;
 }
 
-export function fetchTradingLimits(account?: AccountSelector) {
-    return accountQueryPost<TradingLimits>('/api/v1/portfolio/trading_limits', 'S', account);
+/** `beforeDispatch` 在請求真正送出前執行，丟錯即不送（交易額度的服務時段閘門用） */
+export function fetchTradingLimits(account?: AccountSelector, beforeDispatch?: () => void) {
+    return accountQueryPost<TradingLimits>('/api/v1/portfolio/trading_limits', 'S', account, {}, beforeDispatch);
 }
 
 // ---- 預收券款/圈存（查詢類 only）----
@@ -1591,10 +1680,31 @@ export function fetchComboTrades() {
 
 // ---- server watchlists ----
 
+/**
+ * 伺服器自選清單的成員。region 由 sw／SDK 1.8 起回傳（TW／US）；舊伺服器
+ * 沒有這個欄位，一律視為台股。美股成員的 exchange 是實際交易所
+ * （NASDAQ／NYSE／BATS／TXSE）。
+ */
+export interface ServerWatchlistContract {
+    security_type: SecurityType;
+    exchange: string;
+    code: string;
+    region?: Region;
+}
+
 export interface ServerWatchlist {
     id: string;
     name: string;
-    contracts: { security_type: SecurityType; exchange: string; code: string }[];
+    contracts: ServerWatchlistContract[];
+}
+
+// 自選成員的 wire 格式：region 一律送（舊伺服器忽略）；美股必須帶實際
+// 交易所（NASDAQ／NYSE／BATS／TXSE），缺交易所就不送，避免存成無法還原的成員
+function watchlistContractKey(c: ContractBase) {
+    if (c.region === 'US' && !c.exchange) {
+        throw new Error(`美股 ${c.code} 缺少交易所，無法加入自選`);
+    }
+    return contractKey(c);
 }
 
 export function fetchWatchlists() {
@@ -1607,25 +1717,25 @@ export function createWatchlist(
 ) {
     return apiPost<ServerWatchlist>('/api/v1/watchlist', {
         name,
-        contracts: contracts.map(contractKey),
+        contracts: contracts.map(watchlistContractKey),
     });
 }
 
 export function syncWatchlist(id: string, contracts: ContractBase[]) {
     return apiPut<ServerWatchlist>(`/api/v1/watchlist/${id}`, {
-        contracts: contracts.map(contractKey),
+        contracts: contracts.map(watchlistContractKey),
     });
 }
 
 export function addWatchlistContracts(id: string, contracts: ContractBase[]) {
     return apiPost<ServerWatchlist>(`/api/v1/watchlist/${id}/contracts`, {
-        contracts: contracts.map(contractKey),
+        contracts: contracts.map(watchlistContractKey),
     });
 }
 
 export function removeWatchlistContracts(id: string, contracts: ContractBase[]) {
     return apiDelete<ServerWatchlist>(`/api/v1/watchlist/${id}/contracts`, {
-        contracts: contracts.map(contractKey),
+        contracts: contracts.map(watchlistContractKey),
     });
 }
 

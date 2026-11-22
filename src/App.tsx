@@ -2,6 +2,8 @@
 // Dynamic panel blocks on a draggable grid, with named layout profiles.
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { watchUsTradingState } from './lib/us/us-trading-state';
+import { usBlockRoute } from './lib/us-block-route';
 import GridLayout, {
     useContainerWidth,
     type LayoutItem,
@@ -43,6 +45,7 @@ import { NoticeCenter } from './components/notice-center';
 import { OptPayoff } from './components/opt-payoff';
 import { OptionChain } from './components/option-chain';
 import { OrderConfirmHost } from './components/order-confirm-dialog';
+import { UsRepriceHost } from './components/bottom-dock-us';
 import { primeOrderConfirmSimulation } from './lib/order-confirm';
 import { OrderTicket } from './components/order-ticket';
 import { PanelChrome } from './components/panel-chrome';
@@ -90,13 +93,16 @@ import {
 } from './lib/option-pick';
 import { reportDailyPnl } from './lib/risk';
 import {
-    fetchSnapshots
+    fetchSnapshots,
+    isUsContract,
 } from './lib/shioaji';
 import { isTauri, openPopout } from './lib/tauri';
 import { notify } from './lib/trade';
 import { tradingActionObserved, useTradingState } from './lib/trading-state';
 import { quickOrderBlockMessage } from './lib/quick-order-support';
 import { ensureStream } from './lib/stream';
+import { contractLinkKey, isUsKey } from './lib/contract-key';
+import { createPinSetter, resolveInputContract as resolvePinInput } from './lib/pin-input';
 import { ensureAccounts } from './lib/account-store';
 import type { ContractInfo, SecurityType } from './lib/types/contract';
 import {
@@ -113,6 +119,8 @@ import {
     popoutSessionParam,
     unsupportedPanelCount,
     unsupportedPanelsNotice,
+    takeRetiredPanelCount,
+    RETIRED_US_PANEL_NOTICE,
     withBlockSessionConfig,
     type SessionConfigPatch,
     type Block,
@@ -279,6 +287,11 @@ function BlockBody({
 }) {
     if (contract?.security_type === 'IND' && indexBlockMessage(block.type)) {
         return <IndexBlockUnavailable type={block.type} />;
+    }
+    // 美股：已整合的面板照常顯示；其他跟著商品走的面板統一在這裡擋
+    const usRoute = usBlockRoute(block.type, contract);
+    if (usRoute?.kind === 'unsupported') {
+        return <UsUnsupported />;
     }
     const quickOrderMessage = quickOrderBlockMessage(contract?.security_type, block.type);
     if (quickOrderMessage) {
@@ -631,6 +644,15 @@ function IndexBlockUnavailable({ type }: { type: BlockType }) {
     );
 }
 
+// 美股面板走向見 lib/us-block-route.ts（主視窗與彈出視窗共用）
+function UsUnsupported({ detail }: { detail?: string }) {
+    return (
+        <div className={styles.blockPlaceholder} data-testid='us-unsupported'>
+            美股暫不支援{detail ? `（${detail}）` : ''}
+        </div>
+    );
+}
+
 // 組合商品是行情/圖表身分 — 下單類面板要導向組合單（整體 action ×
 // 組合型別的展開語意，一般單腿下單面板無法表達）
 function comboBlockMessage(type: BlockType): string | null {
@@ -712,13 +734,13 @@ function BlockView(props: BlockViewProps) {
                 symbolName={block.type === 'flash' || block.type === 'oddspread' ? undefined : symbol?.name}
                 pinnable={meta.pinnable}
                 pin={block.pin}
-                currentCode={selected?.code ?? null}
+                currentCode={selected ? contractLinkKey(selected) : null}
                 onPinChange={(pin) => onPinChange(block.id, pin)}
                 link={block.type !== 'flash' ? undefined : {
                     mode: linkMode,
                     groups: linkGroups,
                     // 目前的來源代碼：鎖定／群組用自己的代碼（即使合約還在載入），跟自選才用選取
-                    onMode: (mode) => onLinkMode(block.id, mode, sourceCode ?? contract?.code ?? null),
+                    onMode: (mode) => onLinkMode(block.id, mode, sourceCode ?? (contract ? contractLinkKey(contract) : null)),
                     onGroupCode,
                 }}
                 onRemove={() => {
@@ -739,7 +761,7 @@ function BlockView(props: BlockViewProps) {
                               void openPopout(
                                   block.type,
                                   // 閃電：彈出實際下單的合約（對應商品之後），固定不跟群組
-                                  block.type === 'flash' ? flashTargetRef.current : contract?.code ?? null,
+                                  block.type === 'flash' ? flashTargetRef.current : contract ? contractLinkKey(contract) : null,
                                   // popout 開啟時固定帳戶：面板自己的選擇，跟隨主畫面的市場
                                   // 則取此刻主畫面的選擇（popout 不會即時跟隨）
                                   {
@@ -808,7 +830,10 @@ function PopoutView({
     const quickOrderMessage = quickOrderBlockMessage(contract?.security_type, type);
 
     let body: React.ReactNode = <BlockPlaceholder />;
-    if (type === 'pnl') body = <PnlPanel />;
+    // 美股：和主視窗 BlockBody 同一套分流與「美股暫不支援」防護
+    const usRoute = usBlockRoute(type, contract);
+    if (usRoute?.kind === 'unsupported') body = <UsUnsupported />;
+    else if (type === 'pnl') body = <PnlPanel />;
     else if (type === 'holdingmap')
         // popout 點持股 → 切換主視窗的選取商品；呈現／分組從面板帶入，之後只在這個視窗內切換
         body = (
@@ -961,6 +986,7 @@ function PopoutView({
         <div className={styles.shell}>
             <EventToasts />
             <OrderConfirmHost />
+            <UsRepriceHost />
             <PendingTriggers compact />
             <PendingConfirmPanel compact />
             <section className={panel.panel} style={{ flex: 1, margin: 6 }}>
@@ -978,12 +1004,16 @@ function PopoutView({
 }
 
 export default function App() {
+    // 美股交易狀態在 App 層啟動：有 H 帳戶就開始，不等美股面板打開
+    useEffect(() => (POPOUT_TYPE === 'traypanel' ? undefined : watchUsTradingState()), []);
     if (POPOUT_TYPE === 'traypanel') return <TrayPanel />;
     if (POPOUT_TYPE && POPOUT_TYPES.has(POPOUT_TYPE)) {
         return <PopoutView type={POPOUT_TYPE as BlockType} code={POPOUT_CODE} />;
     }
     return <MainApp />;
 }
+
+const resolveInputContract = (code: string) => resolvePinInput(code, (key) => ensureContract(key));
 
 function MainApp() {
     const {
@@ -1009,7 +1039,8 @@ function MainApp() {
     const [agentHarnessEnabled, setAgentHarnessEnabledState] = useState(
         isAgentHarnessEnabled,
     );
-    const cachedSelected = useContract(selected?.code ?? null);
+    const selectedKey = selected ? contractLinkKey(selected) : null;
+    const cachedSelected = useContract(selectedKey);
     const [workspace, setWorkspace] = useState<Workspace>(() => initializeIndicatorPanels(loadWorkspace()));
     const [profiles, setProfiles] = useState<Profile[]>(loadProfiles);
     // 較新版本存的版面降版讀到：未知面板已在讀入時略過（資料仍保留），提示一次
@@ -1021,6 +1052,7 @@ function MainApp() {
             profiles.reduce((n, p) => n + unsupportedPanelCount(p.workspace), 0),
         );
         if (body) notify({ kind: 'info', title: '有面板此版本不支援', body });
+        if (takeRetiredPanelCount() > 0) notify({ kind: 'info', title: '美股下單已併入下單與閃電面板', body: RETIRED_US_PANEL_NOTICE });
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
     const selectedRef = useRef(selected);
@@ -1051,7 +1083,7 @@ function MainApp() {
         }
         if (selected) {
             const refreshed = items.find(
-                (item) => item.contract.code === selected.code,
+                (item) => contractLinkKey(item.contract) === contractLinkKey(selected),
             );
             // 只在 items 的物件就是 contract cache 的最新物件時才採用 —
             // 若其他面板（權證/個股期/走勢牆）對同一檔 prime 了另一個物
@@ -1062,7 +1094,7 @@ function MainApp() {
             if (
                 refreshed &&
                 refreshed.contract !== selected &&
-                (getCachedContract(selected.code) ?? refreshed.contract) ===
+                (getCachedContract(contractLinkKey(selected)) ?? refreshed.contract) ===
                     refreshed.contract
             ) {
                 setSelected(refreshed.contract);
@@ -1100,7 +1132,8 @@ function MainApp() {
     // select & link a symbol WITHOUT adding it to the watchlist
     const selectByCode = useCallback(
         async (code: string) => {
-            const existing = items.find((i) => i.contract.code === code);
+            // code 是連動 key：台股裸代碼、美股 US:CODE
+            const existing = items.find((i) => contractLinkKey(i.contract) === code);
             if (existing) {
                 setSelected(existing.contract);
                 return;
@@ -1153,12 +1186,13 @@ function MainApp() {
     } | null>(null);
     useEffect(() => {
         const c = selected;
-        if (!c) return;
+        // 美股沒有快照：報價板只用即時逐筆與參考價
+        if (!c || isUsContract(c)) return;
         // 只認 code 當依賴 — items 每輪快照輪詢都換 identity，跟著抖
         // 會變成重複抓
         if (
             items.some(
-                (i) => i.contract.code === c.code && i.snapshot !== undefined,
+                (i) => contractLinkKey(i.contract) === contractLinkKey(c) && i.snapshot !== undefined,
             )
         ) {
             return;
@@ -1178,14 +1212,15 @@ function MainApp() {
             cancelled = true;
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [selected?.code]);
+    }, [selectedKey]);
     const selectedSnapshot = useMemo(
         () =>
-            items.find((i) => i.contract.code === selected?.code)?.snapshot ??
+            selected && isUsContract(selected) ? undefined :
+            items.find((i) => contractLinkKey(i.contract) === selectedKey)?.snapshot ??
             (fallbackSnap && fallbackSnap.code === selected?.code
                 ? fallbackSnap.snap
                 : undefined),
-        [items, selected, fallbackSnap],
+        [items, selected, selectedKey, fallbackSnap],
     );
 
     // ambient observation: one effect catches every selection path
@@ -1195,7 +1230,7 @@ function MainApp() {
             trackActivity('選商品', `${selected.code} ${selected.name}`);
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [selected?.code]);
+    }, [selectedKey]);
 
     // ---- workspace ops ----
 
@@ -1365,17 +1400,21 @@ function MainApp() {
         [workspace, updateWorkspace],
     );
 
-    const setBlockPin = useCallback(
-        (id: string, pin: string | null) => {
-            updateWorkspace({
-                ...workspace,
-                blocks: workspace.blocks.map((b) =>
-                    b.id === id ? { ...b, pin } : b,
-                ),
-            });
-        },
-        [workspace, updateWorkspace],
-    );
+    const storePin = useCallback((id: string, pin: string | null) => {
+        const w = workspaceRef.current;
+        updateWorkspace({
+            ...w,
+            blocks: w.blocks.map((b) => (b.id === id ? { ...b, pin } : b)),
+        });
+    }, [updateWorkspace]);
+    const storePinRef = useRef(storePin);
+    storePinRef.current = storePin;
+    // 手打代碼可能改存 US:CODE；較晚回來的查詢不會蓋掉之後的鎖定／解除
+    const [setBlockPin] = useState(() => createPinSetter({
+        ensure: (key) => ensureContract(key),
+        cached: getCachedContract,
+        store: (id, pin) => storePinRef.current(id, pin),
+    }));
 
     const setBlockWallConfig = useCallback(
         (id: string, wallList: string, wallCols: number, wallRows: number) => {
@@ -1458,12 +1497,12 @@ function MainApp() {
         groupCodeSeq.current[group] = seq;
         const gen = workspaceGenRef.current;
         setGroupPending((p) => ({ ...p, [group]: { code, seq, gen } }));
-        ensureContract(code).then(
+        resolveInputContract(code).then(
             (c) => {
                 clearPending(group, seq);
                 // 期間又輸入了新代碼或套用了別的版面：這次作廢
                 if (groupCodeSeq.current[group] !== seq || workspaceGenRef.current !== gen) return;
-                updateWorkspace(withGroupCode(workspaceRef.current, group, c.code));
+                updateWorkspace(withGroupCode(workspaceRef.current, group, contractLinkKey(c)));
             },
             () => {
                 clearPending(group, seq);
@@ -1600,9 +1639,10 @@ function MainApp() {
                 getPreset: (name) =>
                     LAYOUT_PRESETS.find((preset) => preset.name === name)
                         ?.workspace,
+                // 美股用 US:CODE（例 US:AAPL）；台股照舊裸代碼
                 resolveContract: async (code) => {
                     const existing = itemsRef.current.find(
-                        (item) => item.contract.code === code,
+                        (item) => contractLinkKey(item.contract) === code,
                     );
                     return existing?.contract ?? ensureContract(code);
                 },
@@ -1675,14 +1715,15 @@ function MainApp() {
     });
 
     const jumpToCode = useCallback(
-        async (code: string, securityType?: SecurityType) => {
-            const existing = items.find((i) => i.contract.code === code &&
-                (!securityType || i.contract.security_type === securityType));
+        async (key: string, securityType?: SecurityType) => {
+            const us = isUsKey(key);
+            const existing = items.find((i) => contractLinkKey(i.contract) === key &&
+                (us || !securityType || i.contract.security_type === securityType));
             if (existing) {
                 setSelected(existing.contract);
                 return;
             }
-            const c = await ensureContract(code, securityType);
+            const c = await ensureContract(key, us ? undefined : securityType);
             setSelected(c);
         },
         [items],
@@ -1690,7 +1731,7 @@ function MainApp() {
 
     const watchlistProps = {
         items,
-        selectedCode: selected?.code ?? null,
+        selectedCode: selectedKey,
         onSelect: setSelected,
         onAdd: addSymbol,
         onRemove: removeSymbol,
@@ -1740,6 +1781,7 @@ function MainApp() {
             />
 <EventToasts />
             <OrderConfirmHost />
+            <UsRepriceHost />
             <PendingTriggers />
             <PendingConfirmPanel />
             <CommandPalette
@@ -1754,7 +1796,7 @@ function MainApp() {
                 blocks={workspace.blocks}
                 onAdd={addBlock}
                 onLocate={locateBlock}
-                selectedCode={selected?.code}
+                selectedCode={selectedKey ?? undefined}
             />
 
             <div className={grid.gridWrap} ref={containerRef}>

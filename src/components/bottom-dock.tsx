@@ -36,8 +36,12 @@ import type {
 } from '../lib/types/portfolio';
 import { fmtMoney, fmtSigned } from '../lib/utils/format';
 import { vars } from '../theme.css';
-import { AccountPane, type AccountRefreshControls } from './bottom-dock-account';
+import { AccountPane, UsAccountSection, type AccountRefreshControls } from './bottom-dock-account';
 import { OrdersPane } from './bottom-dock-orders';
+import { useUsDockSummary } from './bottom-dock-us';
+import { refreshUsPositions, refreshUsTrades, usAccounts } from '../lib/us/us-trading-state';
+import { requestUsAccountRefresh } from '../lib/us/us-account-batch';
+import { decIsPositive as decIsPositiveText, fmtDec } from '../lib/us/decimal';
 import { PositionsPane } from './bottom-dock-positions';
 import {
     accountToRef,
@@ -80,6 +84,9 @@ export function BottomDock({
     const queryStatus = portfolio.queries[tab];
     const positionsQuery = portfolio.queries.positions;
     const positionsStatus = queryDisplayState(positionsQuery);
+    // 持倉只因券商暫時性／未開放失敗、沒有其他待對帳原因時，空表顯示灰字而非紅字
+    const positionsFailure = positionsQuery.failure && positionsQuery.reasons.every(r => r === 'query-failed')
+        ? positionsQuery.failure : null;
     const ordersQuery = portfolio.queries.orders;
     const ordersStatus = queryDisplayState(ordersQuery);
     // 操作通知已呈現改刪單結果；不在委託表重複常駐通用提示。
@@ -91,6 +98,11 @@ export function BottomDock({
     const refreshTab = () => {
         void refreshTradingState(tab);
         if (tab === 'account') void accountRefresh?.refresh();
+        // 美股列併在同一張表：同一顆更新按鈕也更新美股
+        if (us.shown && tab === 'orders') void refreshUsTrades();
+        if (us.shown && tab === 'positions') void refreshUsPositions();
+        // 帳務分頁的美股餘額／交割也跟著同一顆更新
+        if (us.shown && tab === 'account') requestUsAccountRefresh();
     };
     const { accounts, selectedStock, selectedFutures } = useAccounts();
     useEffect(ensureAccounts, []);
@@ -148,11 +160,22 @@ export function BottomDock({
         remainingWorkingOrderQuantity(t) > 0,
     ).length;
 
+    // 美股（H 帳戶）列併入委託／持倉表、計數併入分頁標籤；損益不併：台幣與美元分開顯示
+    const us = useUsDockSummary(market !== 'F' && !scope);
+    // 切到持倉分頁時查一次美股庫存（原本由獨立區段掛載時觸發）
+    useEffect(() => {
+        if (tab === 'positions' && us.has) void refreshUsPositions();
+    }, [tab, us.has]);
+    const usPositions = us.shown ? us.positions ?? 0 : 0;
+    const usPending = us.shown && us.positions === null;
+    const posCount = positions.length + usPositions;
+    const ordActive = activeOrders + (us.shown ? us.activeOrders : 0);
+    const ordTotal = scopedTrades.length + (us.shown ? us.totalOrders : 0);
     const tabs: { key: TabKey; label: string }[] = [
-        { key: 'positions', label: `持倉 Positions [${positionsStatus === 'ready' ? positions.length : positions.length > 0 ? `${positions.length}+` : '…'}]` },
+        { key: 'positions', label: `持倉 Positions [${positionsStatus === 'ready' && !usPending ? posCount : posCount > 0 ? `${posCount}+` : '…'}]` },
         {
             key: 'orders',
-            label: `委託 Orders [${ordersStatus === 'ready' ? `${activeOrders}/${scopedTrades.length}` : trades.length > 0 ? `${activeOrders}/${scopedTrades.length}+` : '…'}]`,
+            label: `委託 Orders [${ordersStatus === 'ready' ? `${ordActive}/${ordTotal}` : ordTotal > 0 ? `${ordActive}/${ordTotal}+` : '…'}]`,
         },
         { key: 'account', label: '帳務/交割 Account' },
     ];
@@ -299,7 +322,7 @@ export function BottomDock({
             </div>
             <div className={styles.summaryRow}>
                 <span className={styles.sumItem}>
-                    <span className={styles.sumLabel}>總損益</span>
+                    <span className={styles.sumLabel}>{us.shown ? '總損益（台幣）' : '總損益'}</span>
                     <span
                         className={`${styles.sumValue} ${panel.dirText[pnlDir]}`}
                     >
@@ -313,6 +336,16 @@ export function BottomDock({
                         )}
                     </span>
                 </span>
+                {us.shown && us.pnlUsd !== null && (
+                    <span className={styles.sumItem}>
+                        <span className={styles.sumLabel} title={us.pnlPartial ? '部分美股庫存沒有市價，未計入損益' : undefined}>
+                            美股損益（USD）{us.pnlPartial ? '（部分無市價）' : ''}
+                        </span>
+                        <span className={`${styles.sumValue} ${panel.dirText[us.pnlUsd.trim().startsWith('-') ? 'down' : decIsPositiveText(us.pnlUsd) ? 'up' : 'flat']}`}>
+                            {maskMoney(`${decIsPositiveText(us.pnlUsd) ? '+' : ''}${fmtDec(us.pnlUsd, { minFraction: 2, maxFraction: 2 })}`, privMoney)}
+                        </span>
+                    </span>
+                )}
                 {market !== 'F' && stockRows.length > 0 && (
                     <span className={styles.sumItem}>
                         <span className={styles.sumLabel}>總市值</span>
@@ -346,17 +379,22 @@ export function BottomDock({
                     </span>
                 )}
             </div>
-            {queryError && <div role="status" style={{ padding: '4px 10px', fontSize: 12 }}>{queryError}</div>}
+            {queryError && <div role="status" title={queryStatus.failure?.raw} style={{ padding: '4px 10px', fontSize: 12 }}>{queryError}</div>}
             {tab === 'positions' && (
                 <PositionsPane
                     positions={positions}
                     initialStatus={positionsStatus}
+                    failure={positionsFailure}
+                    onRetry={() => void refreshTradingState('positions')}
+                    twVersion={positionsQuery.updatedAt ?? 0}
                     mode={mode}
                     market={market}
                     scopeKey={scope}
                     fallback={fallback}
                     onChanged={onTradesChanged}
                     onSelectCode={onSelectCode}
+                    // 美股列由 pane 依市場／帳戶範圍篩選（只篩期貨或選單一台股帳戶時不顯示）
+                    us={us.has ? { positions: us.state.positions, status: us.state.positionsStatus, error: us.state.positionsError, version: us.state.positionsVersion } : null}
                 />
             )}
             {tab === 'orders' && (
@@ -375,6 +413,7 @@ export function BottomDock({
                     }}
                     showAllRequest={showAllOrders}
                     onShowAllRequestHandled={() => setShowAllOrders(0)}
+                    us={us.has ? { trades: us.state.trades, hint: us.state.hint, error: us.state.error } : null}
                 />
             )}
             {tab === 'account' && (
@@ -382,6 +421,7 @@ export function BottomDock({
                     <AccountPane
                         mode={mode}
                         funds={portfolio.funds}
+                        onRetryFunds={() => void refreshTradingState('account')}
                         // 股票市值估算要跟摘要列一樣尊重帳戶範圍 — 多帳戶時
                         // 選單一帳戶不能把別的帳戶持倉算進來
                         positions={
@@ -400,6 +440,7 @@ export function BottomDock({
                         scopeAccount={scopeAccount}
                         onRefreshControls={setAccountRefresh}
                     />
+                    {us.shown && <UsAccountSection accounts={usAccounts()} />}
                 </div>
             )}
         </div>

@@ -4,11 +4,11 @@ import { canTrade } from '../lib/account-tradable';
 
 import { reconcileAfterUnknownOutcome } from '../lib/order-outcome';
 import { ChevronDown, ChevronRight } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import { useTradingLive } from '../hooks/use-stream';
 import { contractMarket } from '../lib/contract-market';
 import { ensureContract } from '../lib/contracts-cache';
-import { maskMoney, secretMoney, usePrivacyMode, usePrivacyMoney } from '../lib/privacy';
+import { maskAccountId, maskMoney, secretMoney, usePrivacyMode, usePrivacyMoney } from '../lib/privacy';
 import { useServerInfo, yesterdayQuantityNotice } from '../lib/server-info-store';
 import {
     notify,
@@ -25,6 +25,11 @@ import {
 import { vars } from '../theme.css';
 import { Orb } from './orb';
 import { AsyncStatus } from './async-status';
+import { AccountQueryFailure } from './account-query-failure';
+import type { QueryFailure } from '../lib/trading-state';
+import { UsPositionDetail } from './us-account-panels';
+import { DetailToggle } from './account-detail';
+import { TwPositionDetail } from './tw-account-detail';
 import * as panel from './panel.css';
 import * as styles from './bottom-dock.css';
 import {
@@ -42,6 +47,26 @@ import {
     type SizeClass,
     type ViewMode,
 } from './bottom-dock-shared';
+import { usLinkKey } from '../lib/contract-key';
+import { decAdd, fmtDec, fmtUsAvgPrice, fmtUsPrice } from '../lib/us/decimal';
+import { US_POSITIONS_UNAVAILABLE, type UsPositionsStatus } from '../lib/us/us-trading-state';
+import {
+    fmtUsPnl,
+    usAccountGroupKey,
+    usAmountDir,
+    usPositionRowKey,
+    UsTag,
+    type UsPositionRow,
+} from './bottom-dock-shared';
+
+/** 美股（H 帳戶）庫存資料；dock 決定要不要給（null = 沒有 H 帳戶） */
+export interface UsPositionsInput {
+    positions: UsPositionRow[];
+    status: UsPositionsStatus;
+    error?: string | null;
+    /** 庫存查詢版本（id 每次重新編號） */
+    version?: number;
+}
 
 type SortMode = 'default' | 'value' | 'pnl' | 'code';
 
@@ -62,10 +87,22 @@ function retPctOf(p: AccountedPosition): number {
         : 0;
 }
 
+/** 美股群組損益小計（USD decimal 字串）；沒有可加總的值回 null */
+function usGroupPnl(rows: UsPositionRow[]): string | null {
+    let sum: string | null = null;
+    for (const p of rows) {
+        if (p.pnl === null || p.pnl === undefined) continue;
+        sum = decAdd(sum ?? '0', p.pnl) ?? sum;
+    }
+    return sum;
+}
+
 interface PosGroup {
     key: string;
     label: string;
     rows: AccountedPosition[];
+    /** 美股群組（每個 H 帳戶一組）；不和台股列混算小計 */
+    usRows?: UsPositionRow[];
 }
 
 export function PositionsPane({
@@ -77,8 +114,19 @@ export function PositionsPane({
     fallback,
     onChanged,
     onSelectCode,
+    us = null,
+    failure = null,
+    onRetry,
+    twVersion = 0,
 }: {
+    /** 台股持倉快照版本（查詢時間）：庫存明細的 id 每次查詢重新編號 */
+    twVersion?: number;
     positions: AccountedPosition[];
+    /** 台股持倉查詢只因券商暫時性／未開放失敗（TKAP01 6044、503、AS400）：灰字＋重試 */
+    failure?: QueryFailure | null;
+    onRetry?: () => void;
+    /** 美股庫存；併入同一張表，金額 USD、不和台幣相加。null = 不顯示 */
+    us?: UsPositionsInput | null;
     initialStatus: 'loading' | 'failed' | 'ready';
     mode: ViewMode;
     market: MarketFilter;
@@ -95,6 +143,13 @@ export function PositionsPane({
     const privMoney = usePrivacyMoney();
     const [armed, setArmed] = useState(false);
     const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+    // 庫存列展開的逐筆明細（list_position_detail）：台股、美股同一種互動
+    const [detailOpen, setDetailOpen] = useState<ReadonlySet<string>>(new Set());
+    const toggleDetail = (key: string) => setDetailOpen(prev => {
+        const next = new Set(prev);
+        if (next.has(key)) next.delete(key); else next.add(key);
+        return next;
+    });
     const [busy, setBusy] = useState<{ done: number; total: number } | null>(
         null,
     );
@@ -122,9 +177,22 @@ export function PositionsPane({
         return s;
     }, [rows, sort]);
 
+    // 美股列：只篩期貨或選了單一台股帳戶時不顯示
+    const usVisible = !!us && market !== 'F' && !scopeKey;
+    const usRows = useMemo<UsPositionRow[]>(() => {
+        if (!us || !usVisible || us.status !== 'ready') return [];
+        if (sort === 'code') return [...us.positions].sort((a, b) => a.code.localeCompare(b.code));
+        return us.positions;
+    }, [us, usVisible, sort]);
+    const usNotice = !usVisible || !us ? null
+        : us.status === 'unsupported' ? { err: false, text: US_POSITIONS_UNAVAILABLE }
+        : us.status === 'error' ? { err: true, text: us.error ?? '美股庫存查詢失敗，請按更新重試' }
+        : us.status !== 'ready' ? { err: false, text: '美股庫存查詢中…' }
+        : null;
+
     const groups = useMemo<PosGroup[]>(() => {
         if (mode !== 'grouped') {
-            return [{ key: '', label: '', rows: sortedRows }];
+            return [{ key: '', label: '', rows: sortedRows, usRows }];
         }
         const map = new Map<string, PosGroup>();
         for (const p of sortedRows) {
@@ -137,8 +205,17 @@ export function PositionsPane({
             }
             g.rows.push(p);
         }
+        for (const p of usRows) {
+            const key = usAccountGroupKey(p.account);
+            let g = map.get(key);
+            if (!g) {
+                g = { key, label: `[美] ${p.account.broker_id}-${maskAccountId(p.account.account_id, priv)}`, rows: [], usRows: [] };
+                map.set(key, g);
+            }
+            g.usRows!.push(p);
+        }
         return [...map.values()];
-    }, [sortedRows, mode, fallback, priv]);
+    }, [sortedRows, usRows, mode, fallback, priv]);
 
     // 股名 joined from the contract cache
     const [names, setNames] = useState<Record<string, string>>({});
@@ -274,6 +351,15 @@ export function PositionsPane({
 
     const maxAbsPnl = Math.max(1, ...rows.map((p) => Math.abs(p.pnl)));
 
+    // 台股庫存明細：只有券商快照的列（id ≥ 0；本地成交推估的新列是負 id）且帳戶歸屬明確
+    const twDetailOf = (p: AccountedPosition): { account: NonNullable<AccountedPosition['account']>; market: 'S' | 'F' } | null => {
+        const account = p.account;
+        if (!account || !['S', 'F'].includes(account.account_type) || !Number.isInteger(p.id) || p.id < 0) return null;
+        const market = account.account_type as 'S' | 'F';
+        if ((isStockPosition(p) ? 'S' : 'F') !== market) return null;
+        return { account, market };
+    };
+
     const selectionCell = (p: AccountedPosition) => (
         <input
             type='checkbox'
@@ -286,7 +372,113 @@ export function PositionsPane({
         />
     );
 
-    const renderTable = (list: AccountedPosition[], sz: SizeClass) => (
+    // 美股列：股數、成本／市價／損益皆 USD decimal 字串；不參加平／反與批次平倉
+    const usTableRow = (p: UsPositionRow, sz: SizeClass) => {
+        const dir = usAmountDir(p.pnl);
+        const rowKey = usPositionRowKey(p);
+        const open = detailOpen.has(rowKey);
+        const detailId = Number(p.id);
+        return (
+            <Fragment key={rowKey}>
+            <tr
+                className={styles.clickableRow}
+                onClick={() => onSelectCode(usLinkKey(p.code))}
+                title='點擊連動圖表與下單面板（美股請由下單面板賣出）'
+            >
+                <td className={styles.td} />
+                <td className={styles.td}>
+                    <span className={styles.codeWithToggle}>
+                        {Number.isInteger(detailId) && <DetailToggle open={open} what='庫存明細' onToggle={() => toggleDetail(rowKey)} />}
+                        <span className={styles.codeWithToggleCode}>{p.code}<UsTag /></span>
+                    </span>
+                </td>
+                {sz === 'wide' && <td className={styles.td} />}
+                <td className={`${styles.td} ${panel.dirText[p.direction === 'Buy' ? 'up' : 'down']}`}>
+                    {sz === 'wide'
+                        ? p.direction === 'Buy' ? '多 LONG' : '空 SHORT'
+                        : p.direction === 'Buy' ? '多' : '空'}
+                </td>
+                <td className={`${styles.td} ${styles.qtyCell}`}>
+                    {maskMoney(`${fmtDec(p.quantity)} 股`, privMoney)}
+                </td>
+                {sz === 'wide' && <td className={`${styles.td} ${styles.qtyCell}`}>—</td>}
+                {sz === 'wide' && (
+                    <td className={styles.td}>
+                        {maskMoney(fmtUsAvgPrice(p.price), privMoney)}
+                    </td>
+                )}
+                <td className={styles.td}>
+                    {fmtUsPrice(p.market_price)}
+                </td>
+                <td className={`${styles.td} ${panel.dirText[dir]}`}>
+                    {maskMoney(fmtUsPnl(p.pnl), privMoney)}
+                    {p.pnl !== null && p.pnl !== undefined && <span className={styles.usUnit}>USD</span>}
+                </td>
+                <td className={`${styles.td} ${panel.dirText[dir]}`}>
+                    {p.pnl_pct === null || p.pnl_pct === undefined ? '—' : `${fmtUsPnl(p.pnl_pct)}%`}
+                </td>
+                {sz === 'wide' && <td className={styles.td} />}
+                {sz === 'wide' && <td className={styles.td} />}
+            </tr>
+            {open && (
+                <tr>
+                    <td className={styles.td} />
+                    <td className={styles.td} colSpan={sz === 'wide' ? 11 : 6}>
+                        <UsPositionDetail account={p.account} detailId={detailId} code={p.code} version={us?.version ?? 0} />
+                    </td>
+                </tr>
+            )}
+            </Fragment>
+        );
+    };
+
+    const usCard = (p: UsPositionRow) => {
+        const dir = usAmountDir(p.pnl);
+        return (
+            <div
+                key={usPositionRowKey(p)}
+                className={styles.cardRow}
+                onClick={() => onSelectCode(usLinkKey(p.code))}
+                title='點擊連動圖表與下單面板'
+            >
+                <div className={styles.cardLine}>
+                    <span className={styles.cardCode}>
+                        {p.code}
+                        <UsTag />
+                    </span>
+                    <span className={styles.dirBadge[p.direction === 'Buy' ? 'up' : 'down']}>
+                        {p.direction === 'Buy' ? '多' : '空'}
+                    </span>
+                    <span className={styles.cardSpacer} />
+                    <span className={styles.qtyCell}>
+                        {maskMoney(`${fmtDec(p.quantity)} 股`, privMoney)}
+                    </span>
+                </div>
+                <div className={styles.cardLine}>
+                    <span className={styles.priceStack}>
+                        <span>
+                            <span className={styles.priceStackLabel}>現</span>
+                            {fmtUsPrice(p.market_price)}
+                        </span>
+                        <span>
+                            <span className={styles.priceStackLabel}>均</span>
+                            {maskMoney(fmtUsAvgPrice(p.price), privMoney)}
+                        </span>
+                    </span>
+                    <span className={styles.cardSpacer} />
+                    <span className={panel.dirText[dir]}>
+                        {maskMoney(fmtUsPnl(p.pnl), privMoney)}
+                        <span className={styles.usUnit}>USD</span>{' '}
+                        {p.pnl_pct !== null && p.pnl_pct !== undefined && (
+                            <span className={styles.sumSub}>({fmtUsPnl(p.pnl_pct)}%)</span>
+                        )}
+                    </span>
+                </div>
+            </div>
+        );
+    };
+
+    const renderTable = (list: AccountedPosition[], sz: SizeClass, usList: UsPositionRow[] = []) => (
         <table className={styles.table}>
             <thead>
                 <tr>
@@ -329,9 +521,12 @@ export function PositionsPane({
                 {list.map((p) => {
                     const dir = p.pnl > 0 ? 'up' : p.pnl < 0 ? 'down' : 'flat';
                     const retPct = retPctOf(p);
+                    const rowKey = posKey(p);
+                    const detail = twDetailOf(p);
+                    const open = !!detail && detailOpen.has(rowKey);
                     return (
+                        <Fragment key={rowKey}>
                         <tr
-                            key={posKey(p)}
                             className={styles.clickableRow}
                             onClick={() => onSelectCode(p.code)}
                             title='點擊連動圖表與下單面板'
@@ -342,7 +537,12 @@ export function PositionsPane({
                             >
                                 {selectionCell(p)}
                             </td>
-                            <td className={styles.td}>{p.code}</td>
+                            <td className={styles.td}>
+                                <span className={styles.codeWithToggle}>
+                                    {detail && <DetailToggle open={open} what='庫存明細' onToggle={() => toggleDetail(rowKey)} />}
+                                    <span className={styles.codeWithToggleCode}>{p.code}</span>
+                                </span>
+                            </td>
                             {sz === 'wide' && (
                                 <td className={styles.td}>
                                     {names[p.code] ?? ''}
@@ -465,14 +665,29 @@ export function PositionsPane({
                                 </td>
                             )}
                         </tr>
+                        {open && detail && (
+                            <tr>
+                                <td className={styles.td} />
+                                <td className={styles.td} colSpan={sz === 'wide' ? 11 : 6}>
+                                    <TwPositionDetail
+                                        account={detail.account}
+                                        market={detail.market}
+                                        row={{ id: p.id, code: p.code, direction: p.direction, cond: 'cond' in p ? p.cond : undefined, quantity: p.quantity }}
+                                        version={twVersion}
+                                    />
+                                </td>
+                            </tr>
+                        )}
+                        </Fragment>
                     );
                 })}
+                {usList.map((p) => usTableRow(p, sz))}
             </tbody>
         </table>
     );
 
     // 窄版：兩行卡片式 row（代碼＋方向＋量 / 現價均價疊排＋損益率）
-    const renderCards = (list: AccountedPosition[]) => (
+    const renderCards = (list: AccountedPosition[], usList: UsPositionRow[] = []) => (
         <div>
             {list.map((p) => {
                 const dir = p.pnl > 0 ? 'up' : p.pnl < 0 ? 'down' : 'flat';
@@ -538,11 +753,12 @@ export function PositionsPane({
                     </div>
                 );
             })}
+            {usList.map(usCard)}
         </div>
     );
 
-    const renderRows = (list: AccountedPosition[]) =>
-        size === 'narrow' ? renderCards(list) : renderTable(list, size);
+    const renderRows = (list: AccountedPosition[], usList: UsPositionRow[] = []) =>
+        size === 'narrow' ? renderCards(list, usList) : renderTable(list, size, usList);
 
     const groupSubtotal = (g: PosGroup) => {
         const pnl = g.rows.reduce((s, p) => s + p.pnl, 0);
@@ -563,15 +779,23 @@ export function PositionsPane({
     return (
         <div className={styles.dockBody} ref={measureRef}>
             <div className={styles.paneScroll}>
-                {rows.length === 0 && initialStatus === 'loading' ? (
+                {usNotice && (
+                    <div className={`${styles.usNote} ${usNotice.err ? panel.statusText.err : ''}`} role='status'>
+                        <UsTag />
+                        {usNotice.text}
+                    </div>
+                )}
+                {rows.length === 0 && usRows.length === 0 && initialStatus === 'loading' ? (
                     <div className={styles.emptyState}>
                         <AsyncStatus phase='loading' text='載入持倉…' />
                     </div>
-                ) : rows.length === 0 && initialStatus === 'failed' ? (
+                ) : rows.length === 0 && usRows.length === 0 && initialStatus === 'failed' ? (
                     <div className={styles.emptyState}>
-                        <AsyncStatus phase='error' text='持倉尚未確認，請更新' />
+                        {failure
+                            ? <AccountQueryFailure what='持倉' error={failure.raw} kind={failure.kind} onRetry={() => onRetry?.()} />
+                            : <AsyncStatus phase='error' text='持倉尚未確認，請更新' />}
                     </div>
-                ) : rows.length === 0 ? (
+                ) : rows.length === 0 && usRows.length === 0 ? (
                     <div className={styles.emptyState}>
                         <AsyncStatus phase='empty' text='NO OPEN POSITIONS · 無持倉' />
                     </div>
@@ -603,6 +827,18 @@ export function PositionsPane({
                                     <span className={styles.groupTitle}>
                                         {g.label}
                                     </span>
+                                    {g.usRows ? (
+                                        // 美股群組：損益以 USD 小計，不和台幣相加
+                                        <>
+                                            <span className={styles.groupStat}>
+                                                {g.usRows.length} 筆
+                                            </span>
+                                            <span className={panel.dirText[usAmountDir(usGroupPnl(g.usRows))]}>
+                                                {maskMoney(fmtUsPnl(usGroupPnl(g.usRows)), privMoney)}
+                                                <span className={styles.usUnit}>USD</span>
+                                            </span>
+                                        </>
+                                    ) : (<>
                                     <span className={styles.groupStat}>
                                         {g.rows.length} 筆
                                     </span>
@@ -625,14 +861,15 @@ export function PositionsPane({
                                             privMoney,
                                         )}
                                     </span>
+                                    </>)}
                                     <span className={styles.groupSpacer} />
                                 </button>
-                                {!isCollapsed && renderRows(g.rows)}
+                                {!isCollapsed && renderRows(g.rows, g.usRows)}
                             </div>
                         );
                     })
                 ) : (
-                    renderRows(sortedRows)
+                    renderRows(sortedRows, usRows)
                 )}
             </div>
             <div className={styles.batchBar}>

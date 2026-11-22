@@ -1,0 +1,180 @@
+// src/lib/stream-us-owner.test.ts — 美股 SSE 跟著串流擁有權：交出時關、
+// 接手時替這個視窗已有的美股訂閱重新開（Codex review）
+
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+
+const m = vi.hoisted(() => ({
+    marks: [] as [string, string | undefined][], child: false, autoOwn: true,
+    forget: vi.fn(),
+    claim: null as null | (() => void), release: null as null | (() => void),
+    wants: new Map<string, boolean>(),
+    remote: null as null | ((keys: ReadonlySet<string>) => void),
+    published: [] as unknown[], wire: null as null | ((w: unknown) => void),
+}));
+vi.mock('./shared-stream', () => ({
+    createSharedStream: (options: { onOwn: () => void; onRelease: () => void; onRemoteWants?: (keys: ReadonlySet<string>) => void; onWire?: (w: unknown) => void }) => {
+        m.wire = (w) => options.onWire?.(w);
+        let owner = false;
+        m.remote = (keys) => options.onRemoteWants?.(keys);
+        m.claim = () => { owner = true; options.onOwn(); };
+        m.release = () => { owner = false; options.onRelease(); };
+        if (m.autoOwn) m.claim();
+        return { isOwner: () => owner, publish: (w: unknown) => { m.published.push(w); }, want: (key: string, on: boolean) => { m.wants.set(key, on); } };
+    },
+}));
+vi.mock('./runtime', () => ({ getApiBase: () => 'http://fixture.invalid', getStreamBase: () => 'http://fixture.invalid' }));
+vi.mock('./api', () => ({ apiPost: vi.fn() }));
+vi.mock('./server-info-store', () => ({ forgetServerInfo: m.forget, knownServerInfo: () => ({ simulation: true }) }));
+vi.mock('./startup-timing', () => ({ markStage: (s: string, d?: string) => m.marks.push([s, d]) }));
+vi.mock('./window-role', () => ({ isChildWindow: () => m.child }));
+
+type Listener = (event: { data: string }) => void;
+class FakeEventSource {
+    static all: FakeEventSource[] = [];
+    listeners = new Map<string, Listener[]>();
+    onopen: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    closed = false;
+    constructor(public url: string) { FakeEventSource.all.push(this); }
+    addEventListener(name: string, l: Listener) { this.listeners.set(name, [...(this.listeners.get(name) ?? []), l]); }
+    close() { this.closed = true; }
+    emit(name: string) { for (const l of this.listeners.get(name) ?? []) l({ data: '{}' }); }
+}
+
+beforeEach(() => {
+    vi.resetModules();
+    vi.useFakeTimers();
+    FakeEventSource.all = [];
+    m.marks = [];
+    m.forget.mockClear();
+    m.child = false;
+    m.autoOwn = true;
+    m.claim = null;
+    m.release = null;
+    m.wants.clear();
+    m.remote = null;
+    m.published = [];
+    m.wire = null;
+    vi.stubGlobal('EventSource', FakeEventSource);
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false })));
+});
+afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+const usSources = () => FakeEventSource.all.filter(s => /us_(tick|bidask)/.test(s.url));
+const openUs = () => usSources().filter(s => !s.closed);
+
+it('closes the US SSEs when ownership moves away and re-opens them for existing holds', async () => {
+    const stream = await import('./stream');
+    stream.ensureStream();
+    const release = stream.retainUsQuoteStreams();
+    expect(openUs()).toHaveLength(2);
+
+    m.release!();
+    expect(openUs()).toHaveLength(0);
+    // 非擁有者的重開計時也不會偷開
+    vi.advanceTimersByTime(10_000);
+    expect(openUs()).toHaveLength(0);
+
+    m.claim!();
+    expect(openUs()).toHaveLength(2);
+    release();
+    expect(openUs()).toHaveLength(0);
+});
+
+it('a follower holding US quotes opens nothing until it takes ownership', async () => {
+    m.autoOwn = false;
+    const stream = await import('./stream');
+    stream.ensureStream();
+    stream.retainUsQuoteStreams();
+    expect(usSources()).toHaveLength(0);
+    m.claim!();
+    expect(openUs()).toHaveLength(2);
+});
+
+it('taking ownership without US holds opens no US SSE', async () => {
+    m.autoOwn = false;
+    const stream = await import('./stream');
+    stream.ensureStream();
+    m.claim!();
+    expect(usSources()).toHaveLength(0);
+});
+
+it('owner opens US SSEs for a popout-only US hold and closes them when the popout goes away', async () => {
+    const stream = await import('./stream');
+    stream.ensureStream();
+    expect(usSources()).toHaveLength(0);
+    // 主視窗自己沒有美股訂閱；只有彈出視窗有
+    m.remote!(new Set(['us-quotes']));
+    expect(openUs()).toHaveLength(2);
+    m.remote!(new Set());
+    expect(openUs()).toHaveLength(0);
+});
+
+it('a local release keeps the US SSEs open while a popout still wants them', async () => {
+    const stream = await import('./stream');
+    stream.ensureStream();
+    const release = stream.retainUsQuoteStreams();
+    m.remote!(new Set(['us-quotes']));
+    release();
+    expect(openUs()).toHaveLength(2);
+    m.remote!(new Set());
+    expect(openUs()).toHaveLength(0);
+});
+
+it('a follower announces its US hold to the owner and withdraws it on release', async () => {
+    m.autoOwn = false;
+    const stream = await import('./stream');
+    stream.ensureStream();
+    const release = stream.retainUsQuoteStreams();
+    expect(m.wants.get('us-quotes')).toBe(true);
+    release();
+    expect(m.wants.get('us-quotes')).toBe(false);
+});
+
+it('a hold taken before the shared stream exists is announced once it is created', async () => {
+    m.autoOwn = false;
+    const stream = await import('./stream');
+    stream.retainUsQuoteStreams();
+    expect(m.wants.size).toBe(0);
+    stream.ensureStream();
+    expect(m.wants.get('us-quotes')).toBe(true);
+});
+
+it('signals a US tick stream reset when the US tick SSE drops and again when it reconnects', async () => {
+    const stream = await import('./stream');
+    stream.ensureStream();
+    stream.retainUsQuoteStreams();
+    const resets = vi.fn();
+    stream.onUsTickStreamReset(resets);
+    const tickSource = () => openUs().find(s => /us_tick/.test(s.url))!;
+    tickSource().onopen?.();
+    expect(resets).not.toHaveBeenCalled();
+    // 只有美股 bidask 斷線：成交沒有漏收，不作廢
+    openUs().find(s => /us_bidask/.test(s.url))!.onerror?.();
+    expect(resets).not.toHaveBeenCalled();
+    tickSource().onerror?.();
+    expect(resets).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(3000);
+    tickSource().onopen?.();
+    expect(resets).toHaveBeenCalledTimes(2);
+});
+
+it('relays the US tick stream reset to popouts over the shared wire, and a follower dispatches it locally', async () => {
+    const stream = await import('./stream');
+    stream.ensureStream();
+    stream.retainUsQuoteStreams();
+    openUs().find(s => /us_tick/.test(s.url))!.onerror?.();
+    const resetWire = m.published.find(w => (w as { kind: string; name?: string }).kind === 'event'
+        && !/us_(tick|bidask)$/.test((w as { name: string }).name) && (w as { raw: string }).raw === '');
+    expect(resetWire).toBeDefined();
+
+    // 彈出視窗（非擁有者）：收到同一則 wire 就通知自己的監聽者
+    vi.resetModules();
+    m.autoOwn = false;
+    const follower = await import('./stream');
+    follower.ensureStream();
+    const resets = vi.fn();
+    follower.onUsTickStreamReset(resets);
+    m.wire!(resetWire);
+    expect(resets).toHaveBeenCalledTimes(1);
+});
