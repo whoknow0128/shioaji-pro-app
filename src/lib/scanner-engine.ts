@@ -14,6 +14,7 @@ import {
     computeTodayOpeningBaseline,
     evaluateOpeningVolumeSpike,
     extractPastOpeningVolumes,
+    normalizeOpeningBaseline,
     normalizeOpeningTimeframe,
     openingBarWindow,
     twDayStartSec,
@@ -346,6 +347,7 @@ function evaluateTargetsForCode(
                     const tf = normalizeOpeningTimeframe(cond.params?.timeframe);
                     const lookbackDays = Math.max(1, Math.floor(Number(cond.params?.lookback_days) || 20));
                     const multiplier = Math.max(0.1, Number(cond.params?.multiplier) || 2);
+                    const baselineKind = normalizeOpeningBaseline(cond.params?.baseline);
                     const today0 = twDayStartSec(nowWallSec);
                     const pastVolumes = extractPastOpeningVolumes(fullOpening, today0, tf, lookbackDays);
                     const baseline = getOpeningBaseline(t.code, today0, tf, fullOpening);
@@ -362,12 +364,14 @@ function evaluateTargetsForCode(
                         multiplier,
                         pastVolumes,
                         todayVolume,
+                        baselineKind,
                     });
                     met = res.met;
-                    if (met && res.medianVolume !== null && res.ratio !== null) {
+                    if (met && res.baselineVolume !== null && res.ratio !== null) {
                         const tfText = tf >= 1440 ? '日收盤(13:05)' : `${tf}分K首棒`;
+                        const baseText = baselineKind === 'p90' ? 'P90高標' : '中位數';
                         openingNotes.push(
-                            `${tfText} 今量 ${Math.round(res.todayVolume).toLocaleString()} / 近${res.sampleCount}日中位數 ${Math.round(res.medianVolume).toLocaleString()} (${res.ratio.toFixed(2)}x${res.exceededPct !== null ? `，贏過${res.exceededPct}%交易日` : ''})`,
+                            `${tfText} 今量 ${Math.round(res.todayVolume).toLocaleString()} / 近${res.sampleCount}日${baseText} ${Math.round(res.baselineVolume).toLocaleString()} (${res.ratio.toFixed(2)}x${res.exceededPct !== null ? `，贏過${res.exceededPct}%交易日` : ''})`,
                         );
                     }
                 }

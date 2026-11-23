@@ -72,12 +72,13 @@
           }
         ]
       },
-      "chartInterval": "15m"
+      "chartInterval": "5m",
+      "chartSession": "day"
     },
     {
       "id": "chart-2cb",
       "type": "chart",
-      "pin": "SRFR2",
+      "pin": "TMFR1",
       "indicatorState": {
         "revision": "66c02b05-0987-4dbc-8836-b1dc817d400a",
         "instances": [
@@ -138,7 +139,8 @@
           }
         ]
       },
-      "chartInterval": "60m"
+      "chartInterval": "15m",
+      "chartSession": "all"
     },
     {
       "id": "movers-2c",

@@ -7,8 +7,9 @@
         "type": "opening_vol_spike",
         "params": {
           "timeframe": 30,
-          "lookback_days": 90,
-          "multiplier": 2
+          "lookback_days": 20,
+          "baseline": "p90",
+          "multiplier": 1.6
         }
       }
     ],

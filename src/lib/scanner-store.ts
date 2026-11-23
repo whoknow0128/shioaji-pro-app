@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from 'react';
 import fileStrategiesData from '../config/strategies.json';
-import { normalizeOpeningTimeframe } from './opening-volume';
+import { normalizeOpeningBaseline, normalizeOpeningTimeframe } from './opening-volume';
 
 export interface ScanCondition {
     id: string; // 單一條件的唯一 ID
@@ -174,7 +174,8 @@ export const formatSingleCondition = (c: any) => {
             const tfLabel = tf >= 1440 ? '日收盤 13:05檢查' : `${tf}分K收棒`;
             const days = Number(c.params?.lookback_days) || 20;
             const mult = Number(c.params?.multiplier) || 2;
-            return `[${tfLabel}] 開盤首棒量 >= 近${days}日中位數 ${mult}x`;
+            const baselineLabel = normalizeOpeningBaseline(c.params?.baseline) === 'p90' ? 'P90高標' : '中位數';
+            return `[${tfLabel}] 開盤首棒量 >= 近${days}日${baselineLabel} ${mult}x`;
         }
         default: return c.type;
     }

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useScanTargets, addScanTarget, removeScanTarget, toggleScanTargetActive, updateScanTarget, formatTargetConditions, formatSingleCondition } from '../lib/scanner-store';
 import type { ScanTarget } from '../lib/scanner-store';
-import { normalizeOpeningTimeframe } from '../lib/opening-volume';
+import { normalizeOpeningTimeframe, type OpeningVolBaselineKind } from '../lib/opening-volume';
 import { Trash2, Play, Pause, Plus, Repeat, Bell } from 'lucide-react';
 import { notify } from '../lib/trade';
 
@@ -21,7 +21,8 @@ export function StrategyScannerPanel() {
     const [kdPeriod, setKdPeriod] = useState('9');
     const [timeframe, setTimeframe] = useState('1');
     const [lookbackDays, setLookbackDays] = useState('20');
-    const [volMultiplier, setVolMultiplier] = useState('2');
+    const [volBaseline, setVolBaseline] = useState<OpeningVolBaselineKind>('p90');
+    const [volMultiplier, setVolMultiplier] = useState('1.6');
     const [repeat, setRepeat] = useState(false);
     const [session, setSession] = useState<'all'|'day'|'night'>('all');
 
@@ -38,7 +39,8 @@ export function StrategyScannerPanel() {
         } else if (conditionType === 'opening_vol_spike') {
             params.timeframe = normalizeOpeningTimeframe(timeframe);
             params.lookback_days = Math.max(1, Math.floor(Number(lookbackDays) || 20));
-            params.multiplier = Math.max(0.1, Number(volMultiplier) || 2);
+            params.baseline = volBaseline;
+            params.multiplier = Math.max(0.1, Number(volMultiplier) || 1.6);
         }
 
         setStagedConditions([...stagedConditions, {
@@ -181,7 +183,20 @@ export function StrategyScannerPanel() {
                                     onChange={e => setVolMultiplier(e.target.value)}
                                     style={{ width: '55px', padding: '4px' }}
                                 />
-                                <span>x 中位數</span>
+                                <span>x</span>
+                                <select
+                                    value={volBaseline}
+                                    onChange={e => {
+                                        const next = e.target.value as OpeningVolBaselineKind;
+                                        setVolBaseline(next);
+                                        if (next === 'p90' && volMultiplier === '2') setVolMultiplier('1.6');
+                                        if (next === 'p50' && volMultiplier === '1.6') setVolMultiplier('2');
+                                    }}
+                                    style={{ padding: '4px' }}
+                                >
+                                    <option value="p90">P90高標 (近10%高量)</option>
+                                    <option value="p50">P50中位數</option>
+                                </select>
                             </div>
                         </>
                     )}

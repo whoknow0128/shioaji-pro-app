@@ -3,9 +3,14 @@ import type { Candle } from './types/market';
 
 export const OPENING_VOL_TIMEFRAMES = [15, 30, 60, 1440] as const;
 export type OpeningVolTimeframe = (typeof OPENING_VOL_TIMEFRAMES)[number];
+export type OpeningVolBaselineKind = 'p50' | 'p90';
 
 const H = 3600;
 const DAY = 86400;
+
+export function normalizeOpeningBaseline(v: unknown): OpeningVolBaselineKind {
+    return v === 'p90' ? 'p90' : 'p50';
+}
 
 export interface OpeningBarWindow {
     dayStartSec: number;
@@ -90,6 +95,23 @@ export function computeMedian(values: readonly number[]): number | null {
     return (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
+export function computePercentile(values: readonly number[], percentile: number): number | null {
+    if (values.length === 0) return null;
+    const sorted = [...values].sort((a, b) => a - b);
+    const idx = Math.min(
+        sorted.length - 1,
+        Math.max(0, Math.ceil((percentile / 100) * sorted.length) - 1),
+    );
+    return sorted[idx]!;
+}
+
+export function computeOpeningBaselineValue(
+    values: readonly number[],
+    kind: OpeningVolBaselineKind,
+): number | null {
+    return kind === 'p90' ? computePercentile(values, 90) : computeMedian(values);
+}
+
 export interface TodayOpeningBaseline {
     histVolume: number;
     /** Highest 1m bar label seen in today's historical kbars (0 if none) */
@@ -118,6 +140,8 @@ export interface OpeningVolumeEval {
     readyToCheck: boolean;
     met: boolean;
     todayVolume: number;
+    baselineKind: OpeningVolBaselineKind;
+    baselineVolume: number | null;
     medianVolume: number | null;
     ratio: number | null;
     sampleCount: number;
@@ -131,31 +155,45 @@ export function evaluateOpeningVolumeSpike(params: {
     multiplier: number;
     pastVolumes: readonly number[];
     todayVolume: number;
+    baselineKind?: OpeningVolBaselineKind;
 }): OpeningVolumeEval {
-    const { nowWallSec, todayDayStartSec, timeframe, multiplier, pastVolumes, todayVolume } = params;
+    const {
+        nowWallSec,
+        todayDayStartSec,
+        timeframe,
+        multiplier,
+        pastVolumes,
+        todayVolume,
+        baselineKind = 'p50',
+    } = params;
     const win = openingBarWindow(todayDayStartSec, timeframe);
     const medianVolume = computeMedian(pastVolumes);
+    const baselineVolume = computeOpeningBaselineValue(pastVolumes, baselineKind);
     const sampleCount = pastVolumes.length;
 
-    if (nowWallSec < win.checkStartSec || medianVolume === null || medianVolume <= 0 || todayVolume <= 0) {
+    if (nowWallSec < win.checkStartSec || baselineVolume === null || baselineVolume <= 0 || todayVolume <= 0) {
         return {
             readyToCheck: nowWallSec >= win.checkStartSec,
             met: false,
             todayVolume,
+            baselineKind,
+            baselineVolume,
             medianVolume,
-            ratio: medianVolume && medianVolume > 0 ? todayVolume / medianVolume : null,
+            ratio: baselineVolume && baselineVolume > 0 ? todayVolume / baselineVolume : null,
             sampleCount,
             exceededPct: null,
         };
     }
 
-    const ratio = todayVolume / medianVolume;
+    const ratio = todayVolume / baselineVolume;
     const beatCount = pastVolumes.filter(v => todayVolume >= v).length;
     const exceededPct = Math.round((beatCount / sampleCount) * 100);
     return {
         readyToCheck: true,
         met: ratio >= multiplier,
         todayVolume,
+        baselineKind,
+        baselineVolume,
         medianVolume,
         ratio,
         sampleCount,

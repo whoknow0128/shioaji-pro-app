@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
     computeMedian,
+    computePercentile,
     computeTodayOpeningBaseline,
     evaluateOpeningVolumeSpike,
     extractPastOpeningVolumes,
@@ -133,5 +134,43 @@ describe('opening-volume strategy helpers', () => {
         const base = computeTodayOpeningBaseline(candles, today0, 15);
         expect(base.histVolume).toBe(700);
         expect(base.coveredLabel).toBe(wallClockToUtc('2026-11-24 09:05:00'));
+    });
+
+    it('computes P90 percentile and filters elevated-regime noise days cleanly', () => {
+        // 20-day sample where 90th percentile (index 17, 18th of 20) is 131,000
+        const past20 = [
+            20000, 22000, 24000, 25000, 26000,
+            28000, 30000, 32000, 35000, 38000,
+            40000, 45000, 50000, 65000, 82000,
+            94000, 98000, 131000, 149379, 165144,
+        ];
+        expect(computePercentile(past20, 90)).toBe(131000);
+
+        const today0 = twDayStartSec(wallClockToUtc('2026-11-24 10:00:00'));
+        const now = wallClockToUtc('2026-11-24 10:00:00');
+
+        const mildHigh = evaluateOpeningVolumeSpike({
+            nowWallSec: now,
+            todayDayStartSec: today0,
+            timeframe: 60,
+            multiplier: 1.6,
+            pastVolumes: past20,
+            todayVolume: 165144,
+            baselineKind: 'p90',
+        });
+        expect(mildHigh.met).toBe(false);
+
+        const genuineSpike = evaluateOpeningVolumeSpike({
+            nowWallSec: now,
+            todayDayStartSec: today0,
+            timeframe: 60,
+            multiplier: 1.6,
+            pastVolumes: past20,
+            todayVolume: 277712,
+            baselineKind: 'p90',
+        });
+        expect(genuineSpike.met).toBe(true);
+        expect(genuineSpike.baselineKind).toBe('p90');
+        expect(genuineSpike.baselineVolume).toBe(131000);
     });
 });
