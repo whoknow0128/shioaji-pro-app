@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from 'react';
 import fileStrategiesData from '../config/strategies.json';
+import { normalizeOpeningTimeframe } from './opening-volume';
 
 export interface ScanCondition {
     id: string; // 單一條件的唯一 ID
@@ -168,6 +169,13 @@ export const formatSingleCondition = (c: any) => {
         case 'kd_k_below': return `${prefix}K值小於 ${c.threshold} (KD:${c.params?.kd_period || 9})`;
         case 'kd_d_above': return `${prefix}D值大於 ${c.threshold} (KD:${c.params?.kd_period || 9})`;
         case 'kd_d_below': return `${prefix}D值小於 ${c.threshold} (KD:${c.params?.kd_period || 9})`;
+        case 'opening_vol_spike': {
+            const tf = normalizeOpeningTimeframe(c.params?.timeframe);
+            const tfLabel = tf >= 1440 ? '日收盤 13:05檢查' : `${tf}分K收棒`;
+            const days = Number(c.params?.lookback_days) || 20;
+            const mult = Number(c.params?.multiplier) || 2;
+            return `[${tfLabel}] 開盤首棒量 >= 近${days}日中位數 ${mult}x`;
+        }
         default: return c.type;
     }
 };

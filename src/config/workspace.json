@@ -10,7 +10,7 @@
       "type": "chart",
       "pin": null,
       "indicatorState": {
-        "revision": "c96c3a4d-f820-4e5f-a62d-4cf92ca20c9a",
+        "revision": "e60684b7-f587-46e7-b2a8-448b4e8a542a",
         "instances": [
           {
             "id": "multima-muyjgfn6-2oct",
@@ -69,24 +69,15 @@
               "signal": 9
             },
             "colors": {}
-          },
-          {
-            "id": "dmi-mws7ity2-jelz",
-            "type": "dmi",
-            "params": {
-              "period": 14,
-              "adx": 14
-            },
-            "colors": {}
           }
         ]
       },
-      "chartInterval": "1D"
+      "chartInterval": "15m"
     },
     {
       "id": "chart-2cb",
       "type": "chart",
-      "pin": "SRFR1",
+      "pin": "SRFR2",
       "indicatorState": {
         "revision": "66c02b05-0987-4dbc-8836-b1dc817d400a",
         "instances": [

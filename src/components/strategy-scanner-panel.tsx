@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useScanTargets, addScanTarget, removeScanTarget, toggleScanTargetActive, updateScanTarget, formatTargetConditions, formatSingleCondition } from '../lib/scanner-store';
 import type { ScanTarget } from '../lib/scanner-store';
+import { normalizeOpeningTimeframe } from '../lib/opening-volume';
 import { Trash2, Play, Pause, Plus, Repeat, Bell } from 'lucide-react';
 import { notify } from '../lib/trade';
 
@@ -19,6 +20,8 @@ export function StrategyScannerPanel() {
     const [maPeriod, setMaPeriod] = useState('5');
     const [kdPeriod, setKdPeriod] = useState('9');
     const [timeframe, setTimeframe] = useState('1');
+    const [lookbackDays, setLookbackDays] = useState('20');
+    const [volMultiplier, setVolMultiplier] = useState('2');
     const [repeat, setRepeat] = useState(false);
     const [session, setSession] = useState<'all'|'day'|'night'>('all');
 
@@ -32,6 +35,10 @@ export function StrategyScannerPanel() {
         
         if (['ma_cross_up', 'ma_cross_down', 'kd_cross_up', 'kd_cross_down', 'kd_k_cross_up', 'kd_k_cross_down', 'kd_d_cross_up', 'kd_d_cross_down', 'ma_above', 'ma_below', 'kd_k_above', 'kd_k_below', 'kd_d_above', 'kd_d_below'].includes(conditionType)) {
             params.timeframe = Number(timeframe);
+        } else if (conditionType === 'opening_vol_spike') {
+            params.timeframe = normalizeOpeningTimeframe(timeframe);
+            params.lookback_days = Math.max(1, Math.floor(Number(lookbackDays) || 20));
+            params.multiplier = Math.max(0.1, Number(volMultiplier) || 2);
         }
 
         setStagedConditions([...stagedConditions, {
@@ -60,6 +67,7 @@ export function StrategyScannerPanel() {
     };
 
     const isIndicator = ['ma_cross_up', 'ma_cross_down', 'kd_cross_up', 'kd_cross_down', 'kd_k_cross_up', 'kd_k_cross_down', 'kd_d_cross_up', 'kd_d_cross_down', 'ma_above', 'ma_below', 'kd_k_above', 'kd_k_below', 'kd_d_above', 'kd_d_below'].includes(conditionType);
+    const isOpeningVol = conditionType === 'opening_vol_spike';
     const needsThresholdInput = ['above', 'below', 'kd_k_cross_up', 'kd_k_cross_down', 'kd_d_cross_up', 'kd_d_cross_down', 'kd_k_above', 'kd_k_below', 'kd_d_above', 'kd_d_below'].includes(conditionType);
 
     return (
@@ -79,7 +87,17 @@ export function StrategyScannerPanel() {
             <div style={{ padding: '8px', border: '1px dashed #ccc', marginBottom: '8px', borderRadius: '4px' }}>
                 <div style={{ marginBottom: '8px', fontWeight: 'bold', fontSize: '13px' }}>1. 設計條件 (可疊加)</div>
                 <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
-                    <select value={conditionType} onChange={e => setConditionType(e.target.value)} style={{ padding: '4px' }}>
+                    <select
+                        value={conditionType}
+                        onChange={e => {
+                            const next = e.target.value;
+                            setConditionType(next);
+                            if (next === 'opening_vol_spike' && !['15', '30', '60', '1440'].includes(timeframe)) {
+                                setTimeframe('15');
+                            }
+                        }}
+                        style={{ padding: '4px' }}
+                    >
                         <optgroup label="瞬間觸發 (Trigger)">
                             <option value="above">突破 (大於價位)</option>
                             <option value="below">跌破 (小於價位)</option>
@@ -99,6 +117,9 @@ export function StrategyScannerPanel() {
                             <option value="kd_k_below">K值小於</option>
                             <option value="kd_d_above">D值大於</option>
                             <option value="kd_d_below">D值小於</option>
+                        </optgroup>
+                        <optgroup label="量能異常 (Volume)">
+                            <option value="opening_vol_spike">開盤首棒爆量 (現貨 09:00)</option>
                         </optgroup>
                     </select>
                     
@@ -125,6 +146,44 @@ export function StrategyScannerPanel() {
                                 <option value="10080">周線</option>
                             </select>
                         </div>
+                    )}
+
+                    {isOpeningVol && (
+                        <>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                <span>週期:</span>
+                                <select value={timeframe} onChange={e => setTimeframe(e.target.value)} style={{ padding: '4px' }}>
+                                    <option value="15">15分 (09:15收K)</option>
+                                    <option value="30">30分 (09:30收K)</option>
+                                    <option value="60">60分 (10:00收K)</option>
+                                    <option value="1440">日收盤 (13:05檢查)</option>
+                                </select>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                <span>比較天數:</span>
+                                <input
+                                    type="number"
+                                    min="1"
+                                    max="60"
+                                    value={lookbackDays}
+                                    onChange={e => setLookbackDays(e.target.value)}
+                                    style={{ width: '55px', padding: '4px' }}
+                                />
+                                <span>日</span>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                <span>顯著倍數:</span>
+                                <input
+                                    type="number"
+                                    min="0.1"
+                                    step="0.1"
+                                    value={volMultiplier}
+                                    onChange={e => setVolMultiplier(e.target.value)}
+                                    style={{ width: '55px', padding: '4px' }}
+                                />
+                                <span>x 中位數</span>
+                            </div>
+                        </>
                     )}
 
                     {(conditionType.startsWith('ma_')) && (
