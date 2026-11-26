@@ -18,7 +18,10 @@ import { forgetServerInfo, knownServerInfo } from './server-info-store';
 import { createSharedStream, type StreamWire } from './shared-stream';
 import { invalidateTradingMirror } from './trading-mirror-lease';
 import { invalidateProductCatalog } from './product-catalog-version';
-import { normalizeUsBidAsk, normalizeUsTick, recordUsTick, US_BIDASK_EVENT, US_STREAM_PATHS, US_TICK_EVENT, type RawUsBidAsk, type RawUsTick } from './us/us-quotes';
+import { normalizeUsBidAsk, normalizeUsTick, recordUsTick, type RawUsBidAsk, type RawUsTick } from './us/us-quotes';
+import { postUsStreamAction, probeUsStreamPath, usStreamDataPath, usStreamEventNames, usStreamKindOfEvent, US_STREAM_LEGACY_NAMES, US_STREAM_NAMES } from './us/us-stream-names';
+import { isUsTickFullRejection, isUsTickRegistryKey, noteUsTickFullRejected, rememberUsTickWire, usTickFullKnownAbsent, usTickWire, type UsTickWire } from './us/us-tick-wire';
+import { subscribeUsTickDetail } from './us/us-tick-prefs';
 
 /** `stale`: the EventSource still looks open but no heartbeat or event
  *  arrived within the watchdog window (e.g. the sidecar behind a proxy was
@@ -198,7 +201,8 @@ function handleUsBidAsk(raw: string) {
     if (bidask) ingestBidAsk(bidask);
 }
 
-// 美股行情走獨立 SSE（/stream/data/us_tick、/us_bidask），只在有美股訂閱時
+// 美股行情走獨立 SSE（/stream/data/tick_stk_us、/bidask_stk_us；1.8.0 前是 us_tick、
+// us_bidask，新路徑 404 就退回舊路徑，見 us-stream-names.ts），只在有美股訂閱時
 // 由串流擁有者開啟；收到的事件照樣轉給彈出視窗（shared publish）。
 let usStreamRefs = 0;
 /** 其他（非擁有者）視窗有美股訂閱：擁有者要替它們開美股 SSE 並轉送事件 */
@@ -227,32 +231,53 @@ export function onUsTickStreamReset(listener: () => void) {
     };
 }
 
+const US_QUOTE_STREAM_KINDS = ['tick', 'bidask'] as const;
+/**
+ * 這一輪斷線已經用掉「換名稱後馬上重開」：新舊路徑都 404（例如代理兩個都沒有）時，
+ * 之後只照 3 秒重連計時，不會一直互換名稱馬上重開。任一條美股 SSE 開成功或關掉美股
+ * 串流時重置。
+ */
+let usNameFallbackReopened = false;
+
 function openUsStreams() {
     if (!usWanted() || typeof EventSource === 'undefined') return;
     if (shared && !shared.isOwner()) return;
     if (serverUrlBlocked(getStreamBase()) !== null) { scheduleUsReopen(); return; }
-    for (const [name, path] of Object.entries(US_STREAM_PATHS)) {
-        if (usSources.has(name)) continue;
-        const source = new EventSource(`${getStreamBase()}${path}`);
-        source.addEventListener(name, (event) => {
-            const raw = (event as MessageEvent).data as string;
-            shared?.publish({ kind: 'event', name, raw });
-            if (name === US_TICK_EVENT) handleUsTick(raw); else handleUsBidAsk(raw);
-        });
+    for (const kind of US_QUOTE_STREAM_KINDS) {
+        if (usSources.has(kind)) continue;
+        const base = getApiBase();
+        const source = new EventSource(`${getStreamBase()}${usStreamDataPath(kind, base)}`);
+        let opened = false;
+        // 新舊事件名稱都收：sidecar 只會用其中一個名字送
+        for (const name of usStreamEventNames(kind)) {
+            source.addEventListener(name, (event) => {
+                const raw = (event as MessageEvent).data as string;
+                shared?.publish({ kind: 'event', name, raw });
+                if (kind === 'tick') handleUsTick(raw); else handleUsBidAsk(raw);
+            });
+        }
         source.onerror = () => {
             source.close();
-            usSources.delete(name);
-            if (name === US_TICK_EVENT) { usTickStreamDropped = true; broadcastUsTickStreamReset(); }
+            if (usSources.get(kind) === source) usSources.delete(kind);
+            if (kind === 'tick') { usTickStreamDropped = true; broadcastUsTickStreamReset(); }
+            // 從沒開成功：可能是 sidecar 不認得這套名稱（404），查一次，換了名稱就馬上重開
+            if (!opened) {
+                void probeUsStreamPath(kind, base).then((switched) => {
+                    if (!switched || usNameFallbackReopened || !usWanted() || usSources.has(kind)) return;
+                    usNameFallbackReopened = true;
+                    openUsStreams();
+                });
+            }
             scheduleUsReopen();
         };
-        if (name === US_TICK_EVENT) {
-            source.onopen = () => {
-                if (!usTickStreamDropped) return;
-                usTickStreamDropped = false;
-                broadcastUsTickStreamReset();
-            };
-        }
-        usSources.set(name, source);
+        source.onopen = () => {
+            opened = true;
+            usNameFallbackReopened = false;
+            if (kind !== 'tick' || !usTickStreamDropped) return;
+            usTickStreamDropped = false;
+            broadcastUsTickStreamReset();
+        };
+        usSources.set(kind, source);
     }
 }
 
@@ -281,6 +306,7 @@ export function retainUsQuoteStreams(): () => void {
 function closeUsStreams() {
     usSources.forEach(source => source.close());
     usSources.clear();
+    usNameFallbackReopened = false;
     if (usReopenTimer) { clearTimeout(usReopenTimer); usReopenTimer = null; }
 }
 
@@ -492,6 +518,243 @@ export function unregisterCapabilitySubscription(key: string) {
     capabilityRegistry.delete(key);
 }
 
+/** 已登記的訂閱 body（美股退訂要用訂閱時實際送出的 quote_type） */
+export function getRegisteredSubscription(code: string, quoteType: string): Record<string, unknown> | undefined {
+    return subscriptionRegistry.get(`${code}:${quoteType}`);
+}
+
+type StreamPost = (path: 'subscribe' | 'unsubscribe', body: Record<string, unknown>) => Promise<void>;
+
+/** 訂閱／退訂請求等回應的上限：逾時當作「結果不確定」（請求可能已送達） */
+export const STREAM_REQUEST_TIMEOUT_MS = 10_000;
+
+/**
+ * 行情訂閱請求加上逾時。逾時不取消請求本身（可能已送達），只是不再等它；
+ * 呼叫端依 isDefiniteStreamFailure 判斷結果是否確定。逾時的錯誤帶著原本的請求
+ * （late），呼叫端可以在它之後才完成時再對帳一次（見 ensureUsTickKind）。
+ */
+export function withStreamTimeout<T>(request: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout>;
+    const timedOut = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(Object.assign(new Error('行情訂閱請求逾時，結果不確定'), { requestTimedOut: true as const, late: request })),
+            STREAM_REQUEST_TIMEOUT_MS);
+    });
+    return Promise.race([request, timedOut]).finally(() => clearTimeout(timer));
+}
+
+/** sidecar 明確回了「沒做」（HTTP 錯誤狀態、success=false、或請求根本沒送出） */
+export function isDefiniteStreamFailure(e: unknown): boolean {
+    if (!e || typeof e !== 'object') return false;
+    const x = e as { status?: unknown; streamRejected?: unknown; subscriptionNotStarted?: unknown; mutationNotStarted?: unknown; message?: unknown };
+    if (x.streamRejected === true || x.subscriptionNotStarted === true || x.mutationNotStarted === true) return true;
+    if (typeof x.status === 'number') return true;
+    return typeof x.message === 'string' && /^\d{3}\b/.test(x.message);
+}
+
+const postStream: StreamPost = async (path, body) => {
+    const response = await withStreamTimeout(apiPost<{ success?: boolean; message?: string }>(
+        `/api/v1/stream/${path}`,
+        body,
+    ));
+    if (response.success === false) {
+        throw Object.assign(new Error(response.message || '行情重新訂閱失敗'), { streamRejected: true as const });
+    }
+};
+
+export const usBaseChanged = () => Object.assign(new Error('伺服器位址已變更，美股行情訂閱未完成'), { subscriptionNotStarted: true as const });
+
+// ---- 美股逐筆的每商品鎖 ----
+//
+// 同一個商品的美股逐筆操作（消費者訂閱／退訂、設定切換改訂、重連重播）一律排隊，
+// 一次只有一個在飛：registry 永遠是「目前實際訂著（或最後一次嘗試）」的種類，
+// 不會有改訂途中被重播或退訂用到舊種類、留下 Tick＋TickFull 或沒人管的 TickFull。
+// 每個請求都有逾時（STREAM_REQUEST_TIMEOUT_MS），卡住的回應不會永遠占著鎖。
+// key＝registry key（US:CODE:Tick）。
+const usTickLocks = new Map<string, Promise<unknown>>();
+
+export function withUsTickLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = usTickLocks.get(key) ?? Promise.resolve();
+    const run = prev.then(fn, fn);
+    const tail = run.then(() => undefined, () => undefined);
+    usTickLocks.set(key, tail);
+    void tail.then(() => { if (usTickLocks.get(key) === tail) usTickLocks.delete(key); });
+    return run;
+}
+
+// ---- 美股逐筆：要對帳的商品 ----
+//
+// sidecar 的美股退訂是冪等的（沒訂也回 200 success；Solace 另發的 "Subscription Not Found"
+// 事件本 App 沒有訂閱、不會顯示），而 Tick 與 TickFull 可以同時訂（成交重複、分不出來）。
+// 所以不追蹤「哪一種可能在」，只記「這個商品的結果不確定、要對帳」：
+//   對帳／換訂＝退掉另一種 → 訂上要的那種，兩步都要 2xx 才算完成；任何失敗、逾時都留著
+//   旗標，不先訂新的，由 5 秒後的對帳（或重連重播）再跑一次。
+// 旗標以伺服器位址（base）區分；就算帶到重啟後的 sidecar，也只是多送冪等的退訂／訂閱。
+const usTickReconcile = new Set<string>();
+const reconcileKey = (base: string, key: string) => `${base}|${key}`;
+
+export function needsUsTickReconcile(key: string, base = getApiBase()): boolean {
+    return usTickReconcile.has(reconcileKey(base, key));
+}
+
+export function setUsTickReconcile(key: string, on: boolean, base = getApiBase()) {
+    if (on) usTickReconcile.add(reconcileKey(base, key));
+    else usTickReconcile.delete(reconcileKey(base, key));
+}
+
+export const otherUsTickKind = (kind: UsTickWire): UsTickWire => (kind === 'Tick' ? 'TickFull' : 'Tick');
+
+/**
+ * 退訂一種：2xx 才算完成。TickFull 在確定不支援它的舊 sidecar 上不必退；被舊 sidecar
+ * 以 400 拒絕（不認得）也代表本來就不在。其他失敗（含 429、5xx、逾時）照樣丟出。
+ */
+export async function dropUsTickKind(kind: UsTickWire, base: string, post: (path: 'unsubscribe', kind: UsTickWire) => Promise<unknown>) {
+    if (kind === 'TickFull' && usTickFullKnownAbsent(base)) return;
+    try {
+        await post('unsubscribe', kind);
+    } catch (e) {
+        if (kind !== 'TickFull' || !isUsTickFullRejection(e)) throw e;
+        if (getApiBase() === base) noteUsTickFullRejected(base);
+    }
+}
+
+/**
+ * 把 key 的美股逐筆換成（或補訂）wanted。present：可能訂著的種類（registry、上一次載入
+ * 記下的）；其中有另一種、或這個商品要對帳時，先退掉另一種。送出訂閱前呼叫
+ * beforeSubscribe（registry 先記要訂的種類：結果不確定時關閉／重播也找得到它），
+ * sessionStorage 也先記。TickFull 被舊 sidecar 以 400 拒絕就改訂 Tick。
+ * 任何一步失敗都標記要對帳後丟出。必須在 withUsTickLock(key) 裡呼叫。
+ */
+export async function ensureUsTickKind<R>(opts: {
+    key: string;
+    base: string;
+    present: (UsTickWire | undefined)[];
+    wanted: UsTickWire;
+    post: (path: 'subscribe' | 'unsubscribe', kind: UsTickWire) => Promise<R>;
+    beforeSubscribe: (kind: UsTickWire) => void;
+}): Promise<{ wire: UsTickWire; response: R }> {
+    const { key, base, post } = opts;
+    const code = key.slice(0, -':Tick'.length);
+    let wire = opts.wanted;
+    try {
+        if (needsUsTickReconcile(key, base) || opts.present.includes(otherUsTickKind(wire))) {
+            await dropUsTickKind(otherUsTickKind(wire), base, (path, k) => post(path, k));
+        }
+        if (getApiBase() !== base) throw usBaseChanged();
+        rememberUsTickWire(base, code, wire);
+        opts.beforeSubscribe(wire);
+        let response: R;
+        try {
+            response = await post('subscribe', wire);
+        } catch (e) {
+            if (wire !== 'TickFull' || !isUsTickFullRejection(e) || getApiBase() !== base) throw e;
+            noteUsTickFullRejected(base);
+            wire = 'Tick';
+            rememberUsTickWire(base, code, wire);
+            opts.beforeSubscribe(wire);
+            response = await post('subscribe', wire);
+        }
+        setUsTickReconcile(key, false, base);
+        return { wire, response };
+    } catch (e) {
+        setUsTickReconcile(key, true, base);
+        reconcileWhenLateRequestLands(e, key, base);
+        throw e;
+    }
+}
+
+/**
+ * 逾時的訂閱／退訂之後才在 sidecar 生效時（例如逾時後的對帳已經退了 TickFull、訂了 Tick，
+ * 原本那筆 TickFull 訂閱才完成），結果又變了：再標記對帳、5 秒後跑一次，
+ * 不讓 Tick 與 TickFull 同時在、或要的那種被晚到的退訂拿掉。
+ */
+function reconcileWhenLateRequestLands(e: unknown, key: string, base: string) {
+    const late = (e as { requestTimedOut?: unknown; late?: unknown } | null)?.late;
+    if ((e as { requestTimedOut?: unknown } | null)?.requestTimedOut !== true || !(late instanceof Promise)) return;
+    late.then(() => {
+        if (getApiBase() !== base) return;
+        setUsTickReconcile(key, true, base);
+        scheduleUsTickReconcile();
+    }, () => undefined);
+}
+
+/**
+ * 重播美股逐筆：依目前設定與 sidecar 重新決定 TickFull／Tick（使用者可能換了設定、
+ * sidecar 可能換了版本），在每商品鎖裡讀 registry，經 ensureUsTickKind 換訂或補訂。
+ * onlyIfStale：設定切換／對帳用，種類已對、也不用對帳就不動。
+ */
+function replayUsTick(key: string, post: StreamPost, onlyIfStale = false): Promise<void> {
+    return withUsTickLock(key, async () => {
+        const registered = subscriptionRegistry.get(key);
+        if (!registered) return; // 排隊期間已經被退訂
+        const base = getApiBase();
+        const wanted = usTickWire();
+        const current: UsTickWire = registered.quote_type === 'TickFull' ? 'TickFull' : 'Tick';
+        if (onlyIfStale && current === wanted && !needsUsTickReconcile(key, base)) return;
+        await ensureUsTickKind({
+            key, base, present: [current], wanted,
+            post: (path, kind) => post(path, { ...registered, quote_type: kind }),
+            beforeSubscribe: (kind) => {
+                if (subscriptionRegistry.has(key)) subscriptionRegistry.set(key, kind === current ? registered : { ...registered, quote_type: kind });
+            },
+        });
+    });
+}
+
+// ---- 美股成交資料設定切換（Tick ⇄ TickFull）：即時改訂目前訂閱中的美股逐筆 ----
+//
+// 只動登記的種類跟現在該用的不同的商品（先退舊的再訂新的，見 replayUsTick），
+// 一次一輪、與重連重播錯開；同樣照 50 筆／5 秒的節奏。失敗的留到 5 秒後再試。
+let usTickSwitching: Promise<void> = Promise.resolve();
+/** 已排隊、還沒開始的那一輪：連續觸發只跑一輪 */
+let usTickSwitchQueued: Promise<void> | null = null;
+let usTickSwitchRetry: ReturnType<typeof setTimeout> | null = null;
+
+async function switchUsTicksOnce() {
+    if (replaying) await replaying.catch(() => undefined);
+    const pace = makePacer();
+    const post: StreamPost = async (path, body) => { await pace(); await postStream(path, body); };
+    let failed = false;
+    for (const [key, body] of [...subscriptionRegistry.entries()]) {
+        if (!isUsTickRegistryKey(key)) continue;
+        // 正在改訂中（鎖住）的商品一定要排進來：完成後才知道是不是已經對了
+        if (body.quote_type === usTickWire() && !needsUsTickReconcile(key) && !usTickLocks.has(key)) continue;
+        try {
+            await replayUsTick(key, post, true);
+        } catch {
+            failed = true;
+        }
+    }
+    if (failed) scheduleUsTickReconcile();
+}
+
+/** 5 秒後跑一次美股逐筆對帳（訂閱結果不確定時用） */
+export function scheduleUsTickReconcile() {
+    if (usTickSwitchRetry) return;
+    usTickSwitchRetry = setTimeout(() => {
+        usTickSwitchRetry = null;
+        void resubscribeUsTicks();
+    }, 5000);
+}
+
+/** 美股逐筆依目前設定改訂（設定切換時自動呼叫；回傳下一輪完成的 promise） */
+export function resubscribeUsTicks(): Promise<void> {
+    if (usTickSwitchQueued) return usTickSwitchQueued;
+    const run = () => {
+        usTickSwitchQueued = null;
+        return switchUsTicksOnce();
+    };
+    const next = usTickSwitching.then(run, run);
+    usTickSwitchQueued = next;
+    usTickSwitching = next;
+    return next;
+}
+
+try {
+    subscribeUsTickDetail(() => { void resubscribeUsTicks(); });
+} catch {
+    // 測試整個 mock 掉 us-tick-prefs 時略過
+}
+
 let resubscribeRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Replay after a reconnect is paced: Shioaji documents 50 subscriptions per
@@ -500,6 +763,19 @@ let resubscribeRetryTimer: ReturnType<typeof setTimeout> | null = null;
 export const REPLAY_BATCH = 40;
 export const REPLAY_WINDOW_MS = 5000;
 let replaying: Promise<void> | null = null;
+/** 每 REPLAY_BATCH 筆等滿一個 REPLAY_WINDOW_MS 視窗 */
+function makePacer() {
+    let sent = 0;
+    let windowStart = Date.now();
+    return async () => {
+        if (sent > 0 && sent % REPLAY_BATCH === 0) {
+            const wait = windowStart + REPLAY_WINDOW_MS - Date.now();
+            if (wait > 0) await new Promise(r => setTimeout(r, wait));
+            windowStart = Date.now();
+        }
+        sent++;
+    };
+}
 let replayAgain = false;
 function replay(onlyCapabilities: boolean): Promise<void> {
     if (replaying) { replayAgain = true; return replaying; }
@@ -510,31 +786,24 @@ function replay(onlyCapabilities: boolean): Promise<void> {
     return replaying;
 }
 function resubscribeAll(): Promise<void> { return replay(false); }
+/** 測試用：直接跑一次重播（不經 SSE 重連） */
+export function replayRegisteredSubscriptionsForTest(): Promise<void> { return replay(false); }
 function resubscribeCapabilities(): Promise<void> {
     return capabilityRegistry.size ? replay(true) : Promise.resolve();
 }
 async function replayOnce(onlyCapabilities = false) {
     let failed = false;
-    let sent = 0;
-    let windowStart = Date.now();
-    const pace = async () => {
-        if (sent > 0 && sent % REPLAY_BATCH === 0) {
-            const wait = windowStart + REPLAY_WINDOW_MS - Date.now();
-            if (wait > 0) await new Promise(r => setTimeout(r, wait));
-            windowStart = Date.now();
-        }
-        sent++;
-    };
-    for (const body of onlyCapabilities ? [] : [...subscriptionRegistry.values()]) {
+    const pace = makePacer();
+    const post = postStream;
+    for (const [key, body] of onlyCapabilities ? [] : [...subscriptionRegistry.entries()]) {
         await pace();
         try {
-            const response = await apiPost<{ success?: boolean; message?: string }>(
-                '/api/v1/stream/subscribe',
-                body,
-            );
-            if (response.success === false) {
-                throw new Error(response.message || '行情重新訂閱失敗');
-            }
+            if (isUsTickRegistryKey(key)) {
+                // 這個商品還有操作在飛：不在這裡等它（不讓一個卡住的商品拖住整批重播），
+                // 算這一輪失敗，5 秒後重播時再處理
+                if (usTickLocks.has(key)) { failed = true; continue; }
+                await replayUsTick(key, post);
+            } else await post('subscribe', body);
         } catch {
             failed = true;
         }
@@ -542,10 +811,13 @@ async function replayOnce(onlyCapabilities = false) {
     for (const { path, body } of [...capabilityRegistry.values()]) {
         await pace();
         try {
-            const response = await apiPost<{ success: boolean; message: string }>(
-                `/api/v1/stream/subscribe/${path}`,
-                body,
-            );
+            // 美股停牌：依 sidecar 用新（halt_stk_us）或舊（us_halt）名稱，404／405 自動換
+            const response = usStreamKindOfEvent(path) === 'halt'
+                ? await postUsStreamAction<{ success: boolean; message: string }>('subscribe', 'halt', body)
+                : await apiPost<{ success: boolean; message: string }>(
+                    `/api/v1/stream/subscribe/${path}`,
+                    body,
+                );
             if (!response.success) throw new Error(response.message);
         } catch {
             failed = true;
@@ -765,8 +1037,8 @@ function dispatchWire(wire: StreamWire) {
     if (name === 'tick_stk' || name === 'tick_fop') handleTick(raw);
     else if (name === 'bidask_stk' || name === 'bidask_fop') handleBidAsk(raw);
     else if (name === 'quote_idx') handleIndexQuote(raw);
-    else if (name === US_TICK_EVENT) handleUsTick(raw);
-    else if (name === US_BIDASK_EVENT) handleUsBidAsk(raw);
+    else if (name === US_STREAM_NAMES.tick || name === US_STREAM_LEGACY_NAMES.tick) handleUsTick(raw);
+    else if (name === US_STREAM_NAMES.bidask || name === US_STREAM_LEGACY_NAMES.bidask) handleUsBidAsk(raw);
     else if (name === 'order_event') handleOrderEvent(raw);
     else if (name === 'contract_event') {
         const change = JSON.parse(raw) as ContractChangeEvent;
