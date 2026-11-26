@@ -19,5 +19,26 @@
     "session": "day",
     "id": "scan-1795455855918-pavt5",
     "status": "monitoring"
+  },
+  {
+    "code": "00631L",
+    "conditions": [
+      {
+        "id": "cond-1795458513062",
+        "type": "opening_vol_spike",
+        "params": {
+          "timeframe": 60,
+          "lookback_days": 20,
+          "baseline": "p90",
+          "multiplier": 1.6
+        }
+      }
+    ],
+    "action": "alert",
+    "active": true,
+    "repeat": false,
+    "session": "day",
+    "id": "scan-1795458523407-hvdf7",
+    "status": "monitoring"
   }
 ]

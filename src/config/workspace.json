@@ -71,9 +71,7 @@
             "colors": {}
           }
         ]
-      },
-      "chartInterval": "5m",
-      "chartSession": "day"
+      }
     },
     {
       "id": "chart-2cb",
@@ -139,8 +137,7 @@
           }
         ]
       },
-      "chartInterval": "15m",
-      "chartSession": "all"
+      "chartInterval": "60m"
     },
     {
       "id": "movers-2c",
