@@ -1028,7 +1028,20 @@ export function CandleChart({
 
     useEffect(() => {
         const id = setInterval(() => countdownRef.current?.tick(), 1000);
-        return () => clearInterval(id);
+        const onVis = () => {
+            if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+            gapReloadAtRef.current = 0;
+            countdownRef.current?.refresh();
+        };
+        if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+            document.addEventListener('visibilitychange', onVis);
+        }
+        return () => {
+            clearInterval(id);
+            if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+                document.removeEventListener('visibilitychange', onVis);
+            }
+        };
     }, []);
 
     // load kbars on symbol/timeframe change; pages of older history are

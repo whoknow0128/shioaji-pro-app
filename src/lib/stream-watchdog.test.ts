@@ -203,3 +203,46 @@ it('attaches named event families even when only a follower consumes them', asyn
         expect(first.listeners.has(name)).toBe(true);
     }
 });
+
+it('immediately reconnects when returning to foreground while down', async () => {
+    const docListeners: Record<string, (() => void)[]> = {};
+    vi.stubGlobal('document', {
+        visibilityState: 'hidden',
+        addEventListener: (ev: string, fn: () => void) => {
+            (docListeners[ev] ??= []).push(fn);
+        },
+        removeEventListener: () => {},
+    });
+    const { stream, first } = await open();
+    first.onerror!();
+    expect(stream.getStreamStatus()).toBe('down');
+    const before = FakeEventSource.all.length;
+    // Simulate returning to foreground without waiting for backoff timer
+    (document as { visibilityState: string }).visibilityState = 'visible';
+    for (const fn of docListeners.visibilitychange ?? []) fn();
+    expect(FakeEventSource.all.length).toBe(before + 1);
+    FakeEventSource.all.at(-1)!.onopen!();
+    expect(stream.getStreamStatus()).toBe('live');
+});
+
+it('probes and reconnects within 2s if foregrounded after silent stale period', async () => {
+    const docListeners: Record<string, (() => void)[]> = {};
+    vi.stubGlobal('document', {
+        visibilityState: 'hidden',
+        addEventListener: (ev: string, fn: () => void) => {
+            (docListeners[ev] ??= []).push(fn);
+        },
+        removeEventListener: () => {},
+    });
+    const { stream, first } = await open();
+    // Advance past STALE_AFTER_MS without triggering watchdog ticks (simulating sleep)
+    vi.setSystemTime(Date.now() + stream.STALE_AFTER_MS + 10_000);
+    (document as { visibilityState: string }).visibilityState = 'visible';
+    for (const fn of docListeners.visibilitychange ?? []) fn();
+    expect(fetchMock).toHaveBeenCalled(); // immediate /health probe
+    const before = FakeEventSource.all.length;
+    vi.advanceTimersByTime(2000);
+    expect(stream.getStreamStatus()).toBe('stale');
+    expect(first.closed).toBe(true);
+    expect(FakeEventSource.all.length).toBe(before + 1);
+});

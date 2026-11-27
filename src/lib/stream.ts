@@ -1210,6 +1210,64 @@ async function watchMaintenance() {
     }
 }
 
+const FOREGROUND_DEBOUNCE_MS = 1000;
+const FOREGROUND_VERIFY_MS = 2000;
+let lastForegroundProbeAt = 0;
+let foregroundVerifyTimer: ReturnType<typeof setTimeout> | null = null;
+
+function onForeground() {
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    if (held || (shared && !shared.isOwner())) return;
+    const now = Date.now();
+    if (now - lastForegroundProbeAt < FOREGROUND_DEBOUNCE_MS) return;
+    lastForegroundProbeAt = now;
+
+    // 美股獨立 SSE 若已處於 CLOSED，立即清理並重開
+    if (usWanted()) {
+        for (const [kind, source] of usSources) {
+            if (source.readyState === 2) {
+                source.close();
+                usSources.delete(kind);
+            }
+        }
+        openUsStreams();
+    }
+
+    if (status === 'down' || status === 'stale' || !es || es.readyState === 2) {
+        if (foregroundVerifyTimer) { clearTimeout(foregroundVerifyTimer); foregroundVerifyTimer = null; }
+        if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+        retryDelay = 1000;
+        everDown = true;
+        markStream('stream-restart', 'reason=foreground-reconnect');
+        connect();
+        void watchMaintenance();
+        return;
+    }
+
+    // 表面仍是 live：先探測伺服器維護狀態，若已沉默超過 STALE_AFTER_MS，
+    // 給 2 秒讓休眠期間排隊的緩衝事件送達，仍無動靜就立刻判 stale 重連
+    void watchMaintenance();
+    const probeAt = lastActivity;
+    if (probeAt > 0 && now - probeAt > STALE_AFTER_MS && !foregroundVerifyTimer) {
+        foregroundVerifyTimer = setTimeout(() => {
+            foregroundVerifyTimer = null;
+            if (shared && !shared.isOwner()) return;
+            if (!es || status !== 'live') return;
+            if (lastActivity > probeAt) return; // 已收到新事件
+            const silent = !heartbeatSinceOpen;
+            if (silent) silentConnections++;
+            setStatus('stale');
+            everDown = true;
+            retryDelay = 1000;
+            if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+            markStream('stream-restart', 'reason=foreground-stale');
+            es.close();
+            es = null;
+            connect();
+        }, FOREGROUND_VERIFY_MS);
+    }
+}
+
 let started = false;
 export function ensureStream() {
     if (!started) {
@@ -1251,6 +1309,14 @@ export function ensureStream() {
         lastCheckAt = Date.now();
         watchdogTimer = setInterval(checkWatchdog, WATCHDOG_TICK_MS);
         setInterval(watchMaintenance, 60000);
+        if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'visible') onForeground();
+            });
+        }
+        if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+            window.addEventListener('focus', onForeground);
+        }
     }
 }
 
