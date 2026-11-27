@@ -24,6 +24,7 @@ const KIND_LABEL: Record<OutputDef['kind'], string> = {
     histogram: '柱狀',
     points: '圓點',
     band: '區域帶',
+    boxes: '缺口區',
 };
 
 const DEFAULT_SOURCE = `// 範例：雙 EMA 動能震盪（改成你自己的邏輯）

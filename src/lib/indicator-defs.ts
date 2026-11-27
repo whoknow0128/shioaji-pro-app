@@ -29,9 +29,10 @@ import {
     wma,
     type IndicatorPoint,
 } from './indicators';
+import { computeFvgGaps, type PriceZone } from './fvg-gap';
 import type { Candle } from './types/market';
 
-export type OutputKind = 'line' | 'dashed' | 'histogram' | 'points' | 'band';
+export type OutputKind = 'line' | 'dashed' | 'histogram' | 'points' | 'band' | 'boxes';
 
 export interface ParamDef {
     key: string;
@@ -71,6 +72,10 @@ export interface IndicatorDef {
         bars: Candle[],
         p: Record<string, number>,
     ) => Record<string, IndicatorPoint[]>;
+    computeBoxes?: (
+        bars: Candle[],
+        p: Record<string, number>,
+    ) => Record<string, PriceZone[]>;
 }
 
 export const INDICATOR_DEFS: IndicatorDef[] = [
@@ -273,6 +278,59 @@ export const INDICATOR_DEFS: IndicatorDef[] = [
             const r = keltner(b, p.period!, p.atrPeriod!, p.mult!);
             return { mid: r.mid, upper: r.upper, lower: r.lower };
         },
+    },
+    {
+        type: 'fvg',
+        label: 'FVG & 缺口區域',
+        short: 'FVG',
+        desc: '三棒失衡區 (FVG) 與相鄰跳空缺口，保留歷史已回補紀錄',
+        aliases: ['fvg', 'fair value gap', 'gap', 'imbalance', '缺口', '跳空', '失衡'],
+        category: 'overlay',
+        params: [
+            {
+                key: 'mode',
+                label: '偵測類型',
+                def: 0,
+                options: [
+                    { value: 0, label: 'FVG + 跳空缺口' },
+                    { value: 1, label: '僅 FVG 失衡區' },
+                    { value: 2, label: '僅跳空缺口' },
+                ],
+            },
+            { key: 'maxZones', label: '最大顯示數量', def: 20, min: 1, max: 200 },
+            {
+                key: 'showHistory',
+                label: '歷史已回補',
+                def: 1,
+                options: [
+                    { value: 1, label: '保留顯示 (淡化)' },
+                    { value: 0, label: '僅顯示未回補' },
+                ],
+            },
+            {
+                key: 'mitigateMode',
+                label: '回補判定',
+                def: 0,
+                options: [
+                    { value: 0, label: '完全回補' },
+                    { value: 1, label: '觸及邊緣即回補' },
+                ],
+            },
+        ],
+        outputs: [
+            { key: 'bullFvg', label: '看漲 FVG', kind: 'boxes', color: '#1fd286' },
+            { key: 'bearFvg', label: '看跌 FVG', kind: 'boxes', color: '#ff4d6a' },
+            { key: 'bullGap', label: '向上跳空', kind: 'boxes', color: '#3d8bff' },
+            { key: 'bearGap', label: '向下跳空', kind: 'boxes', color: '#b06fff' },
+        ],
+        compute: () => ({}),
+        computeBoxes: (b, p) =>
+            computeFvgGaps(b, {
+                mode: p.mode ?? 0,
+                maxZones: p.maxZones ?? 20,
+                showHistory: (p.showHistory ?? 1) !== 0,
+                mitigateMode: p.mitigateMode ?? 0,
+            }),
     },
     // ---- 副圖震盪 ----
     {

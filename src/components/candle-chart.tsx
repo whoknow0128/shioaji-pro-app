@@ -79,6 +79,7 @@ import { IndicatorInstanceContext } from '../lib/indicator-instance-context';
 import {
     daySessionLabel,
     filterDaySession,
+    hasNightSession,
     isDaySessionLabel,
     sessionKindOf,
     parseChartSessionMode,
@@ -105,6 +106,8 @@ import {
     PriceBandPrimitive,
     type PriceBandPoint,
 } from '../lib/price-band';
+import { boxColors, PriceBoxPrimitive } from '../lib/price-box';
+import type { PriceZone } from '../lib/fvg-gap';
 import { notify, placeQuickOrder } from '../lib/trade';
 import { captureServerMode } from '../lib/server-info-store';
 import { creditEnquireCond, creditSideBlocks, creditStatus, prepareCreditOrder, useCreditEnquire, type CreditCheck } from '../lib/credit-eligibility';
@@ -156,6 +159,7 @@ import {
 import { roundToTick, tickDecimals, tickSizeFor } from '../lib/utils/ticksize';
 import { createOhlcStore } from '../lib/ohlc-legend';
 import { HighLowLayer, type HighLowStyle } from '../lib/chart-highlow';
+import { BarCountdownLayer } from '../lib/chart-countdown';
 import type { ChartColors } from '../lib/theme-store';
 import { OhlcLegend } from './ohlc-legend';
 import * as styles from './candle-chart.css';
@@ -325,6 +329,7 @@ export function CandleChart({
         onShowHighLowChange?.(!showHighLow);
     };
     const highLowRef = useRef<HighLowLayer | null>(null);
+    const countdownRef = useRef<BarCountdownLayer | null>(null);
     // 讀值列自己訂閱這個 store：讀值變動只重繪讀值列
     const ohlcStore = useMemo(createOhlcStore, []);
     const [hostWidth, setHostWidth] = useState(0);
@@ -583,6 +588,7 @@ export function CandleChart({
                 series: ISeriesApi<'Line' | 'Histogram'>;
                 last?: number;
                 precision?: number;
+                staticText?: string;
             }[]
         >(),
     );
@@ -681,6 +687,13 @@ export function CandleChart({
         > = {};
         legendMetaRef.current.forEach((metas, instId) => {
             out[instId] = metas.map((m) => {
+                if (m.staticText !== undefined) {
+                    return {
+                        label: m.label,
+                        text: m.staticText,
+                        color: m.color,
+                    };
+                }
                 let v = m.last;
                 const d = param?.seriesData?.get(m.series) as
                     | { value?: number }
@@ -764,6 +777,17 @@ export function CandleChart({
         const highLow = new HighLowLayer({ ...highLowColors(c), visible: false, format: (p) => String(p) });
         candles.attachPrimitive(highLow);
         highLowRef.current = highLow;
+        // 右側價格軸即時收 K 倒數（緊貼最新價標籤下方）
+        const countdown = new BarCountdownLayer({
+            getLastBar: () => lastBarRef.current,
+            tfMinutes: tf.minutes,
+            kind,
+            upColor: c.up,
+            downColor: c.down,
+            clampSessionEnd: supportsSessionSplit(contract) || !hasNightSession(kind),
+        });
+        candles.attachPrimitive(countdown);
+        countdownRef.current = countdown;
 
         chart.subscribeClick((param) => {
             // 第二道防線：畫圖選取／草稿／拖曳／文字／量測均不能進入下單路徑。
@@ -898,6 +922,7 @@ export function CandleChart({
             candleSeriesRef.current = null;
             volSeriesRef.current = null;
             highLowRef.current = null;
+            countdownRef.current = null;
         };
     }, []);
 
@@ -988,6 +1013,23 @@ export function CandleChart({
         });
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [showHighLow, themeKey, ohlcDecimals]);
+
+    // 右側即時價格軸收 K 剩餘時間倒數
+    useEffect(() => {
+        countdownRef.current?.setOptions({
+            tfMinutes: tf.minutes,
+            kind,
+            upColor: colors.up,
+            downColor: colors.down,
+            clampSessionEnd: supportsSessionSplit(contract) || !hasNightSession(kind),
+        });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [tf.minutes, kind, themeKey, contract, dataVersion]);
+
+    useEffect(() => {
+        const id = setInterval(() => countdownRef.current?.tick(), 1000);
+        return () => clearInterval(id);
+    }, []);
 
     // load kbars on symbol/timeframe change; pages of older history are
     // pulled on demand by the visible-range subscription (loadMoreRef)
@@ -1384,8 +1426,10 @@ export function CandleChart({
                 params[p.key] = inst.params[p.key] ?? p.def;
             }
             let out: Record<string, IndicatorPoint[]>;
+            let boxOut: Record<string, PriceZone[]> | null = null;
             try {
                 out = def.compute(bars, params);
+                boxOut = def.computeBoxes ? def.computeBoxes(bars, params) : null;
             } catch {
                 continue; // a bad param combination must not kill the chart
             }
@@ -1398,6 +1442,7 @@ export function CandleChart({
                 series: ISeriesApi<'Line' | 'Histogram'>;
                 last?: number;
                 precision?: number;
+                staticText?: string;
             }[] = [];
             const lastVal = (pts: IndicatorPoint[]) => {
                 for (let i = pts.length - 1; i >= 0; i--) {
@@ -1421,6 +1466,55 @@ export function CandleChart({
                 lastValueVisible: inst.showLabels ?? false,
             };
             for (const o of def.outputs) {
+                if (o.kind === 'boxes' && boxOut) {
+                    const st = outputStyle(inst, def, o.key);
+                    if (!st.visible) continue;
+                    const zones = boxOut[o.key] ?? [];
+                    const activeCount = zones.filter((z) => !z.mitigated).length;
+                    const anchor = chart.addSeries(
+                        LineSeries,
+                        {
+                            color: 'rgba(0,0,0,0)',
+                            lineVisible: false,
+                            pointMarkersVisible: false,
+                            crosshairMarkerVisible: false,
+                            autoscaleInfoProvider: () => null,
+                            priceLineVisible: false,
+                            lastValueVisible: false,
+                            ...priceFormatOpt,
+                        },
+                        pane,
+                    );
+                    // anchor 必須涵蓋完整 K 棒時間點，lightweight-charts 的
+                    // series.priceToCoordinate() 才不會在 bars[0] 捲出視窗
+                    // 時因 firstValue() 為 null 而回傳 null
+                    anchor.setData(
+                        bars.map((b) => ({
+                            time: b.time as UTCTimestamp,
+                            value: b.close,
+                        })),
+                    );
+                    if (zones.length > 0) {
+                        anchor.attachPrimitive(
+                            new PriceBoxPrimitive({
+                                boxes: zones,
+                                ...boxColors(st.color, st.opacity),
+                                borderWidth: st.width,
+                            }),
+                        );
+                    }
+                    indSeriesRef.current.push(
+                        anchor as ISeriesApi<'Line' | 'Histogram'>,
+                    );
+                    firstSeries ??= anchor as ISeriesApi<'Line' | 'Histogram'>;
+                    metas.push({
+                        label: o.label,
+                        color: st.color,
+                        series: anchor as ISeriesApi<'Line' | 'Histogram'>,
+                        staticText: String(activeCount),
+                    });
+                    continue;
+                }
                 const pts = out[o.key];
                 if (!pts) continue;
                 const st = outputStyle(inst, def, o.key);

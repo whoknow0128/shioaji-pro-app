@@ -40,6 +40,7 @@ import {
 } from '../lib/indicator-defs';
 import { CustomIndicatorEditor } from './custom-indicator-editor';
 import { bandColors } from '../lib/price-band';
+import { boxColors } from '../lib/price-box';
 import * as styles from './indicator-dialog.css';
 
 const WIDTHS: (1 | 2 | 3 | 4)[] = [1, 2, 3, 4];
@@ -600,18 +601,28 @@ export function IndicatorSettingsModal({
                         <>
                             {def.outputs.map((o) => {
                                 const s = outputStyle(inst, def, o.key);
-                                // band 由 PriceBandPrimitive 繪製，線型選單
+                                // band / boxes 由 primitive 繪製，線型選單
                                 // （折線／柱狀／圓點…）對它沒有作用，不顯示；
-                                // 粗細仍套在上下緣線
+                                // 粗細仍套在邊線
                                 const isBand = o.kind === 'band';
+                                const isBoxes = o.kind === 'boxes';
+                                const isZone = isBand || isBoxes;
                                 const isLine =
-                                    isBand ||
+                                    isZone ||
                                     (s.plot !== 'histogram' &&
                                         s.plot !== 'circles');
                                 const lineStyle = outputLineStyle(o);
-                                const band = isBand
+                                const zoneColors = isBand
                                     ? bandColors(s.color, s.opacity)
-                                    : null;
+                                    : isBoxes
+                                      ? (() => {
+                                            const bc = boxColors(s.color, s.opacity);
+                                            return {
+                                                fillColor: bc.activeFill,
+                                                borderColor: bc.activeBorder,
+                                            };
+                                        })()
+                                      : null;
                                 return (
                                     <div
                                         key={o.key}
@@ -670,16 +681,16 @@ export function IndicatorSettingsModal({
                                                                 100,
                                                         }}
                                                     />
-                                                    {band ? (
+                                                    {zoneColors ? (
                                                         <span
                                                             className={
                                                                 styles.previewBand
                                                             }
                                                             style={{
                                                                 background:
-                                                                    band.fillColor,
-                                                                borderTop: `${s.width}px ${lineStyle} ${band.borderColor}`,
-                                                                borderBottom: `${s.width}px ${lineStyle} ${band.borderColor}`,
+                                                                    zoneColors.fillColor,
+                                                                borderTop: `${s.width}px ${lineStyle} ${zoneColors.borderColor}`,
+                                                                borderBottom: `${s.width}px ${lineStyle} ${zoneColors.borderColor}`,
                                                             }}
                                                         />
                                                     ) : (
@@ -702,7 +713,7 @@ export function IndicatorSettingsModal({
                                                         />
                                                     )}
                                                 </button>
-                                                {!isBand && (
+                                                {!isZone && (
                                                     <button
                                                         className={
                                                             styles.plotBtn[
@@ -736,7 +747,7 @@ export function IndicatorSettingsModal({
                                                 }
                                             />
                                         )}
-                                        {plotFor === o.key && !isBand && (
+                                        {plotFor === o.key && !isZone && (
                                             <div
                                                 className={styles.plotMenu}
                                             >
