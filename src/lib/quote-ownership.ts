@@ -65,6 +65,7 @@ export const RELEASE_GRACE_MS = 1500;
 // 開關面板才再退：隔一段時間自己重跑一次同步。期間有人又要了，就不會退。
 export const RELEASE_RETRY_MS = 10_000;
 let releaseRetry: ReturnType<typeof setTimeout> | undefined;
+let subscribeRetry: ReturnType<typeof setTimeout> | undefined;
 function scheduleReleaseRetry() {
     if (releaseRetry !== undefined) return;
     releaseRetry = setTimeout(() => {
@@ -72,6 +73,13 @@ function scheduleReleaseRetry() {
         // 沒連上時不必空打：連線恢復（live）本來就會同步一次
         if (getStreamStatus() === 'live') sync(true);
     }, RELEASE_RETRY_MS);
+}
+function scheduleSubscribeRetry() {
+    if (subscribeRetry !== undefined) return;
+    subscribeRetry = setTimeout(() => {
+        subscribeRetry = undefined;
+        if (getStreamStatus() === 'live') sync(true);
+    }, 5_000);
 }
 // #201: quotes the App's background engine watches. A page going away
 // (reload, closed main window) never unsubscribes them: the engine keeps
@@ -96,7 +104,7 @@ function sync(immediate = false) {
             // 先記再送：請求送出後頁面才卸載，訂閱也不會漏記
             remember(key, value);
             channel?.postMessage({ kind: 'held', keys: [key] }); // 別的分頁正準備清理時也要看得到
-            try { await subscribeQuote(value.contract, value.type, ...oddOpts(value)); active.set(key, value); } catch { /* reconnect registry/manual re-acquire retries */ }
+            try { await subscribeQuote(value.contract, value.type, ...oddOpts(value)); active.set(key, value); } catch { scheduleSubscribeRetry(); }
         }
         if (![...active.keys()].some(key => !desired.has(key))) return;
         if (!immediate) await new Promise(resolve => setTimeout(resolve, RELEASE_GRACE_MS));
@@ -207,6 +215,8 @@ function dispose() {
     stopStatus();
     stopOwner();
     clearTimeout(sweepTimer);
+    clearTimeout(releaseRetry);
+    clearTimeout(subscribeRetry);
     // 釘住的留給背景引擎，不算孤兒
     for (const key of pinned.keys()) ledger.delete(key);
     saveLedger();

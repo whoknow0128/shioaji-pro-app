@@ -287,3 +287,24 @@ it('when both US path variants 404, only one immediate fallback reopen; later on
     await flush();
     expect(openUs()).toHaveLength(0);
 });
+
+it('reopens US tick SSE when bidask is active while tick stays silent past 30s', async () => {
+    const stream = await import('./stream');
+    stream.ensureStream();
+    const release = stream.retainUsQuoteStreams();
+    const tickEs = FakeEventSource.all.find((s) => s.url.includes('tick'))!;
+    const bidaskEs = FakeEventSource.all.find((s) => s.url.includes('bidask'))!;
+    tickEs.onopen!();
+    bidaskEs.onopen!();
+
+    // Advance 35s while only bidask receives quotes
+    vi.advanceTimersByTime(35_000);
+    bidaskEs.emit('bidask_stk_us', JSON.stringify({ code: 'NVDA', ts: Date.now(), bid_price: [100], bid_volume: [1], ask_price: [101], ask_volume: [1] }));
+    vi.advanceTimersByTime(stream.WATCHDOG_TICK_MS);
+
+    expect(tickEs.closed).toBe(true);
+    expect(bidaskEs.closed).toBe(false);
+    const tickSources = FakeEventSource.all.filter((s) => s.url.includes('tick'));
+    expect(tickSources.length).toBe(2);
+    release();
+});

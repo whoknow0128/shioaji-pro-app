@@ -210,6 +210,7 @@ let remoteUsWanted = false;
 const US_WANT_KEY = 'us-quotes';
 const usWanted = () => usStreamRefs > 0 || remoteUsWanted;
 const usSources = new Map<string, EventSource>();
+const usLastActivity: Record<'tick' | 'bidask', number> = { tick: 0, bidask: 0 };
 let usReopenTimer: ReturnType<typeof setTimeout> | null = null;
 /** 美股成交 SSE 斷線或斷線後重連（期間可能漏收成交；庫存即時價要作廢） */
 const usTickStreamResetListeners = new Set<() => void>();
@@ -248,9 +249,11 @@ function openUsStreams() {
         const base = getApiBase();
         const source = new EventSource(`${getStreamBase()}${usStreamDataPath(kind, base)}`);
         let opened = false;
+        usLastActivity[kind] = Date.now();
         // 新舊事件名稱都收：sidecar 只會用其中一個名字送
         for (const name of usStreamEventNames(kind)) {
             source.addEventListener(name, (event) => {
+                usLastActivity[kind] = Date.now();
                 const raw = (event as MessageEvent).data as string;
                 shared?.publish({ kind: 'event', name, raw });
                 if (kind === 'tick') handleUsTick(raw); else handleUsBidAsk(raw);
@@ -272,12 +275,34 @@ function openUsStreams() {
         };
         source.onopen = () => {
             opened = true;
+            usLastActivity[kind] = Date.now();
             usNameFallbackReopened = false;
             if (kind !== 'tick' || !usTickStreamDropped) return;
             usTickStreamDropped = false;
             broadcastUsTickStreamReset();
         };
         usSources.set(kind, source);
+    }
+}
+
+/** 五檔仍在持續進事件、但美股逐筆 SSE 靜默超過門檻時，判定逐筆假連線並重開 */
+function checkUsWatchdog(now = Date.now(), minSilenceMs = 30_000) {
+    if (!usWanted() || (shared && !shared.isOwner())) return;
+    const tickSource = usSources.get('tick');
+    if (!tickSource) return;
+    const tickAt = usLastActivity.tick;
+    const bidaskAt = usLastActivity.bidask;
+    if (
+        tickAt > 0 &&
+        bidaskAt > tickAt &&
+        now - tickAt > minSilenceMs &&
+        bidaskAt - tickAt > minSilenceMs
+    ) {
+        tickSource.close();
+        usSources.delete('tick');
+        usTickStreamDropped = true;
+        broadcastUsTickStreamReset();
+        openUsStreams();
     }
 }
 
@@ -306,6 +331,8 @@ export function retainUsQuoteStreams(): () => void {
 function closeUsStreams() {
     usSources.forEach(source => source.close());
     usSources.clear();
+    usLastActivity.tick = 0;
+    usLastActivity.bidask = 0;
     usNameFallbackReopened = false;
     if (usReopenTimer) { clearTimeout(usReopenTimer); usReopenTimer = null; }
 }
@@ -342,7 +369,13 @@ function ingestTick(tick: SseTick) {
     emitQuote(tick.code);
     // flash only on real deals — simtrade (試撮) updates must not blink
     if (!tick.simtrade && tick.volume > 0) {
-        tickTapeListeners.forEach((l) => l(tick));
+        tickTapeListeners.forEach((l) => {
+            try {
+                l(tick);
+            } catch (err) {
+                console.error('[stream] tickTape listener threw', err);
+            }
+        });
     }
 }
 
@@ -990,6 +1023,7 @@ let lastCheckGap = 0;
 function checkWatchdog() {
     if (shared && !shared.isOwner()) return;
     const now = Date.now();
+    checkUsWatchdog(now, 30_000);
     const gap = lastCheckAt > 0 ? now - lastCheckAt : 0;
     // One grace per resume: only when this check is late but the previous one
     // was on time and the stream was not already silent then. A throttled
@@ -1222,7 +1256,7 @@ function onForeground() {
     if (now - lastForegroundProbeAt < FOREGROUND_DEBOUNCE_MS) return;
     lastForegroundProbeAt = now;
 
-    // 美股獨立 SSE 若已處於 CLOSED，立即清理並重開
+    // 美股獨立 SSE 若已處於 CLOSED 或五檔有動但逐筆沉默逾 15s，立即清理並重開
     if (usWanted()) {
         for (const [kind, source] of usSources) {
             if (source.readyState === 2) {
@@ -1231,6 +1265,7 @@ function onForeground() {
             }
         }
         openUsStreams();
+        checkUsWatchdog(now, 15_000);
     }
 
     if (status === 'down' || status === 'stale' || !es || es.readyState === 2) {
